@@ -669,7 +669,7 @@ bool my_like_range_mb(const CHARSET_INFO *cs, const char *ptr,
         "a\0\0..." is the smallest possible string for PAD SPACE.
         "a\xff\xff..." is the biggest possible string.
       */
-      if ((cs->state & MY_CS_BINSORT) || cs->pad_attribute == NO_PAD) {
+      if (cs->pad_attribute == NO_PAD) {
         *min_length = static_cast<size_t>(min_str - min_org);
 
         /*

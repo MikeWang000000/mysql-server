@@ -3308,3 +3308,13 @@ SELECT a FROM t1 WHERE a = 'aaa ';
 a
 aaa
 DROP TABLE t1;
+#
+# Bug #116584: Query produces different resultset with force index
+#
+CREATE TABLE t1(c1 VARCHAR(16), KEY idx (c1)) COLLATE utf8mb4_bin;
+INSERT INTO t1 VALUES ('000'), ('111'), ('abc\n');
+SELECT * FROM t1 FORCE INDEX(idx) WHERE c1 LIKE 'abc%';
+c1
+abc
+
+DROP TABLE t1;

@@ -1675,3 +1675,13 @@ INSERT INTO t1 VALUES('aaa'), ('aaaa'), ('aaaaa');
 # One row expected.
 SELECT a FROM t1 WHERE a = 'aaa ';
 DROP TABLE t1;
+
+--echo #
+--echo # Bug #116584: Query produces different resultset with force index
+--echo #
+CREATE TABLE t1(c1 VARCHAR(16), KEY idx (c1)) COLLATE utf8mb4_bin;
+INSERT INTO t1 VALUES ('000'), ('111'), ('abc\n');
+# In PAD_SPACE collation, 'abc\n' is less than 'abc'
+# But 'abc\n' should be matched in 'abc%' like range query
+SELECT * FROM t1 FORCE INDEX(idx) WHERE c1 LIKE 'abc%';
+DROP TABLE t1;
