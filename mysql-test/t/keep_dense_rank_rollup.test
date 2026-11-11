@@ -1,0 +1,189 @@
+--echo #
+--echo # KEEP combined with MySQL GROUP BY ... WITH ROLLUP
+--echo # Oracle equivalent syntax is GROUP BY ROLLUP(...)
+--echo #
+
+CREATE TABLE t (a INT, b INT, c INT, d INT);
+INSERT INTO t VALUES
+  (1, 10, 1, 1),
+  (1, 20, 2, 1),
+  (1, 30, 2, 2),
+  (2, 40, 1, 1),
+  (2, 50, NULL, 2),
+  (3, NULL, 3, 1),
+  (3, 60, 3, 2),
+  (4, 70, NULL, 1);
+
+--echo # Grouped KEEP: single-column rollup
+SELECT a, SUM(b) KEEP (DENSE_RANK FIRST ORDER BY c) AS s
+FROM t GROUP BY a WITH ROLLUP ORDER BY a;
+
+SELECT a, SUM(b) KEEP (DENSE_RANK LAST ORDER BY c) AS s
+FROM t GROUP BY a WITH ROLLUP ORDER BY a;
+
+--echo # Grouped KEEP: multi-column rollup
+SELECT a, d, SUM(b) KEEP (DENSE_RANK FIRST ORDER BY c) AS s
+FROM t GROUP BY a, d WITH ROLLUP ORDER BY a, d;
+
+SELECT a, d, SUM(b) KEEP (DENSE_RANK LAST ORDER BY c) AS s
+FROM t GROUP BY a, d WITH ROLLUP ORDER BY a, d;
+
+--echo # All aggregate functions, MySQL semantics for STDDEV/VARIANCE
+SELECT a,
+       MIN(b) KEEP (DENSE_RANK FIRST ORDER BY c) AS mn,
+       MAX(b) KEEP (DENSE_RANK FIRST ORDER BY c) AS mx,
+       SUM(b) KEEP (DENSE_RANK FIRST ORDER BY c) AS sm,
+       AVG(b) KEEP (DENSE_RANK FIRST ORDER BY c) AS av,
+       COUNT(b) KEEP (DENSE_RANK FIRST ORDER BY c) AS cnt,
+       COUNT(*) KEEP (DENSE_RANK FIRST ORDER BY c) AS cnt_star,
+       STDDEV(b) KEEP (DENSE_RANK FIRST ORDER BY c) AS sd,
+       VARIANCE(b) KEEP (DENSE_RANK FIRST ORDER BY c) AS var
+FROM t GROUP BY a WITH ROLLUP ORDER BY a;
+
+--echo # GROUPING() in SELECT / HAVING / ORDER BY
+SELECT a, d, GROUPING(a) AS ga, GROUPING(d) AS gd,
+       SUM(b) KEEP (DENSE_RANK FIRST ORDER BY c) AS s
+FROM t GROUP BY a, d WITH ROLLUP ORDER BY a, d;
+
+SELECT a, d, SUM(b) KEEP (DENSE_RANK FIRST ORDER BY c) AS s
+FROM t GROUP BY a, d WITH ROLLUP
+HAVING GROUPING(a) = 1 ORDER BY a, d;
+
+SELECT a, d, SUM(b) KEEP (DENSE_RANK FIRST ORDER BY c) AS s
+FROM t GROUP BY a, d WITH ROLLUP
+ORDER BY GROUPING(a), a, d;
+
+--echo # KEEP in an expression, ORDER BY and HAVING
+SELECT a, ROUND(AVG(b) KEEP (DENSE_RANK FIRST ORDER BY c), 2) + 1 AS av
+FROM t GROUP BY a WITH ROLLUP ORDER BY a;
+
+SELECT a, SUM(b) AS s
+FROM t GROUP BY a WITH ROLLUP
+ORDER BY SUM(b) KEEP (DENSE_RANK FIRST ORDER BY c) DESC;
+
+SELECT a, SUM(b) KEEP (DENSE_RANK FIRST ORDER BY c) AS s
+FROM t GROUP BY a WITH ROLLUP
+HAVING SUM(b) KEEP (DENSE_RANK FIRST ORDER BY c) > 40 ORDER BY a;
+
+--echo # Three rollup columns
+SELECT a, d, c, SUM(b) KEEP (DENSE_RANK FIRST ORDER BY c) AS s
+FROM t GROUP BY a, d, c WITH ROLLUP ORDER BY a, d, c;
+
+--echo # SQL_BIG_RESULT
+SELECT SQL_BIG_RESULT a, SUM(b) KEEP (DENSE_RANK FIRST ORDER BY c) AS s
+FROM t GROUP BY a WITH ROLLUP ORDER BY a;
+
+--echo # Prepared statement, executed twice
+PREPARE stmt FROM
+  'SELECT a, d, SUM(b) KEEP (DENSE_RANK FIRST ORDER BY c) AS s
+   FROM t GROUP BY a, d WITH ROLLUP ORDER BY a, d';
+EXECUTE stmt;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
+
+--echo # Derived table, view, CTAS
+SELECT * FROM (
+  SELECT a, d, SUM(b) KEEP (DENSE_RANK FIRST ORDER BY c) AS s
+  FROM t GROUP BY a, d WITH ROLLUP
+) dt ORDER BY a, d;
+
+CREATE VIEW vkeep_rollup AS
+  SELECT a, d, SUM(b) KEEP (DENSE_RANK FIRST ORDER BY c) AS s
+  FROM t GROUP BY a, d WITH ROLLUP;
+SELECT * FROM vkeep_rollup ORDER BY a, d;
+SHOW CREATE VIEW vkeep_rollup;
+DROP VIEW vkeep_rollup;
+
+CREATE TABLE tctas AS
+  SELECT a, d, SUM(b) KEEP (DENSE_RANK FIRST ORDER BY c) AS s
+  FROM t GROUP BY a, d WITH ROLLUP;
+SELECT * FROM tctas ORDER BY a, d;
+SHOW CREATE TABLE tctas;
+DROP TABLE tctas;
+
+--echo # Empty input
+SELECT a, SUM(b) KEEP (DENSE_RANK FIRST ORDER BY c) AS s
+FROM t WHERE 1 = 0 GROUP BY a WITH ROLLUP ORDER BY a;
+
+--echo # Window KEEP over rollup output rows
+SELECT a, d, SUM(SUM(b)) KEEP (DENSE_RANK FIRST ORDER BY MAX(c))
+         OVER (PARTITION BY a) AS s
+FROM t GROUP BY a, d WITH ROLLUP ORDER BY a, d;
+
+SELECT a, d, SUM(SUM(b)) KEEP (DENSE_RANK LAST ORDER BY MAX(c))
+         OVER (PARTITION BY a) AS s
+FROM t GROUP BY a, d WITH ROLLUP ORDER BY a, d;
+
+SELECT a, SUM(SUM(b)) KEEP (DENSE_RANK FIRST ORDER BY MAX(c)) OVER () AS s
+FROM t GROUP BY a WITH ROLLUP ORDER BY a;
+
+SELECT a, d, SUM(SUM(b)) KEEP (DENSE_RANK FIRST ORDER BY MAX(c))
+         OVER (PARTITION BY GROUPING(a)) AS s
+FROM t GROUP BY a, d WITH ROLLUP ORDER BY a, d;
+
+--echo # GROUPING() is allowed inside window KEEP arguments
+SELECT a, d,
+       SUM(GROUPING(a)) KEEP (DENSE_RANK FIRST ORDER BY MAX(c))
+         OVER (PARTITION BY a) AS s
+FROM t GROUP BY a, d WITH ROLLUP ORDER BY a, d;
+
+SELECT a, d,
+       SUM(SUM(b)) KEEP (DENSE_RANK FIRST ORDER BY GROUPING(a))
+         OVER (PARTITION BY a) AS s
+FROM t GROUP BY a, d WITH ROLLUP ORDER BY a, d;
+
+--echo # Window KEEP together with another window function
+SELECT a, d,
+       ROW_NUMBER() OVER (PARTITION BY a ORDER BY d) AS rn,
+       SUM(SUM(b)) KEEP (DENSE_RANK FIRST ORDER BY MAX(c))
+         OVER (PARTITION BY a) AS s
+FROM t GROUP BY a, d WITH ROLLUP ORDER BY a, d;
+
+--echo # Window KEEP prepared twice, view and CTAS
+PREPARE stmt2 FROM
+  'SELECT a, SUM(SUM(b)) KEEP (DENSE_RANK FIRST ORDER BY MAX(c))
+          OVER (PARTITION BY a) AS s
+   FROM t GROUP BY a WITH ROLLUP ORDER BY a';
+EXECUTE stmt2;
+EXECUTE stmt2;
+DEALLOCATE PREPARE stmt2;
+
+CREATE VIEW vkeep_rollup_win AS
+  SELECT a, d,
+         SUM(SUM(b)) KEEP (DENSE_RANK FIRST ORDER BY MAX(c))
+           OVER (PARTITION BY a) AS s
+  FROM t GROUP BY a, d WITH ROLLUP;
+SELECT * FROM vkeep_rollup_win ORDER BY a, d;
+SHOW CREATE VIEW vkeep_rollup_win;
+DROP VIEW vkeep_rollup_win;
+
+CREATE TABLE tctas_win AS
+  SELECT a, d,
+         SUM(SUM(b)) KEEP (DENSE_RANK FIRST ORDER BY MAX(c))
+           OVER (PARTITION BY a) AS s
+  FROM t GROUP BY a, d WITH ROLLUP;
+SELECT * FROM tctas_win ORDER BY a, d;
+SHOW CREATE TABLE tctas_win;
+DROP TABLE tctas_win;
+
+--echo # Oracle-style GROUP BY ROLLUP() remains a syntax error
+--error ER_PARSE_ERROR
+SELECT a, SUM(b) KEEP (DENSE_RANK FIRST ORDER BY c) AS s
+FROM t GROUP BY ROLLUP(a);
+
+--echo # GROUPING() is not allowed in grouped KEEP arguments or ORDER BY
+--error ER_INVALID_GROUP_FUNC_USE
+SELECT a, SUM(b) KEEP (DENSE_RANK FIRST ORDER BY GROUPING(a)) AS s
+FROM t GROUP BY a WITH ROLLUP;
+
+--error ER_INVALID_GROUP_FUNC_USE
+SELECT a, SUM(GROUPING(a)) KEEP (DENSE_RANK FIRST ORDER BY c) AS s
+FROM t GROUP BY a WITH ROLLUP;
+
+--echo # Ungrouped references in the window form keep the usual grouping error
+--error ER_WRONG_FIELD_WITH_GROUP
+SELECT a, SUM(b) KEEP (DENSE_RANK FIRST ORDER BY c)
+         OVER (PARTITION BY a) AS s
+FROM t GROUP BY a WITH ROLLUP;
+
+DROP TABLE t;

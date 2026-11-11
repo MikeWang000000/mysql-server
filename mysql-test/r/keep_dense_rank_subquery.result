@@ -1,0 +1,271 @@
+#
+# KEEP (DENSE_RANK ...) with subqueries in various positions
+#
+CREATE TABLE tk (g INT, id INT, v INT, o INT);
+INSERT INTO tk VALUES
+(1, 1, 10, 2),
+(1, 2, 20, 1),
+(1, 3, 30, 1),
+(2, 4, 40, 2),
+(2, 5, 50, NULL),
+(3, 6, NULL, 3);
+CREATE TABLE tlook (id INT, x INT);
+INSERT INTO tlook VALUES
+(1, 100), (2, 200), (3, 300), (4, 400), (5, NULL), (6, 600);
+CREATE TABLE tg (g INT);
+INSERT INTO tg VALUES (1), (2), (3);
+# Subquery in the wrapped aggregate's argument
+SELECT g,
+SUM((SELECT x FROM tlook WHERE tlook.id = tk.id))
+KEEP (DENSE_RANK FIRST ORDER BY o NULLS LAST) AS s
+FROM tk GROUP BY g ORDER BY g;
+g	s
+1	500
+2	400
+3	600
+SELECT g,
+SUM((SELECT x FROM tlook WHERE tlook.id = tk.id))
+KEEP (DENSE_RANK LAST ORDER BY o NULLS FIRST) AS s
+FROM tk GROUP BY g ORDER BY g;
+g	s
+1	100
+2	400
+3	600
+# Subquery argument with all supported aggregates
+SELECT MIN((SELECT x FROM tlook WHERE tlook.id = tk.id))
+KEEP (DENSE_RANK FIRST ORDER BY o NULLS LAST) AS mn,
+MAX((SELECT x FROM tlook WHERE tlook.id = tk.id))
+KEEP (DENSE_RANK FIRST ORDER BY o NULLS LAST) AS mx,
+ROUND(AVG((SELECT x FROM tlook WHERE tlook.id = tk.id))
+KEEP (DENSE_RANK FIRST ORDER BY o NULLS LAST), 2) AS av,
+COUNT((SELECT x FROM tlook WHERE tlook.id = tk.id))
+KEEP (DENSE_RANK FIRST ORDER BY o NULLS LAST) AS cnt,
+STDDEV((SELECT x FROM tlook WHERE tlook.id = tk.id))
+KEEP (DENSE_RANK FIRST ORDER BY o NULLS LAST) = 50 AS sd_ok,
+VARIANCE((SELECT x FROM tlook WHERE tlook.id = tk.id))
+KEEP (DENSE_RANK FIRST ORDER BY o NULLS LAST) = 2500 AS var_ok
+FROM tk;
+mn	mx	av	cnt	sd_ok	var_ok
+200	300	250.00	2	1	1
+# Subquery in KEEP's ORDER BY
+SELECT g,
+SUM(v) KEEP (DENSE_RANK FIRST ORDER BY
+(SELECT x FROM tlook WHERE tlook.id = tk.id) NULLS LAST) AS s
+FROM tk GROUP BY g ORDER BY g;
+g	s
+1	10
+2	40
+3	NULL
+SELECT g,
+SUM(v) KEEP (DENSE_RANK LAST ORDER BY
+(SELECT x FROM tlook WHERE tlook.id = tk.id) NULLS FIRST) AS s
+FROM tk GROUP BY g ORDER BY g;
+g	s
+1	30
+2	40
+3	NULL
+# Subqueries in both the argument and ORDER BY
+SELECT g,
+SUM((SELECT x FROM tlook WHERE tlook.id = tk.id))
+KEEP (DENSE_RANK FIRST ORDER BY
+(SELECT x FROM tlook WHERE tlook.id = tk.id) DESC) AS s
+FROM tk GROUP BY g ORDER BY g;
+g	s
+1	300
+2	400
+3	600
+# EXISTS subquery in KEEP's ORDER BY
+SELECT g,
+SUM(v) KEEP (DENSE_RANK FIRST ORDER BY
+EXISTS (SELECT 1 FROM tlook
+WHERE tlook.id = tk.id AND tlook.x > 250)) AS s
+FROM tk GROUP BY g ORDER BY g;
+g	s
+1	30
+2	50
+3	NULL
+# Subquery in WHERE
+SELECT g, SUM(v) KEEP (DENSE_RANK FIRST ORDER BY o NULLS LAST) AS s
+FROM tk
+WHERE id IN (SELECT id FROM tlook WHERE x >= 300)
+GROUP BY g ORDER BY g;
+g	s
+1	30
+2	40
+3	NULL
+# Subquery in HAVING
+SELECT g, SUM(v) KEEP (DENSE_RANK FIRST ORDER BY o NULLS LAST) AS s
+FROM tk GROUP BY g
+HAVING SUM(v) KEEP (DENSE_RANK FIRST ORDER BY o NULLS LAST)
+> (SELECT MIN(v) FROM tk)
+ORDER BY g;
+g	s
+1	50
+2	40
+# Subquery in query-level ORDER BY
+SELECT g, SUM(v) KEEP (DENSE_RANK FIRST ORDER BY o NULLS LAST) AS s
+FROM tk GROUP BY g
+ORDER BY (SELECT x FROM tlook WHERE tlook.id = g) DESC;
+g	s
+3	NULL
+2	40
+1	50
+# KEEP in a correlated scalar subquery
+SELECT tg.g,
+(SELECT SUM(v) KEEP (DENSE_RANK FIRST ORDER BY o NULLS LAST)
+FROM tk WHERE tk.g = tg.g) AS s
+FROM tg ORDER BY tg.g;
+g	s
+1	50
+2	40
+3	NULL
+# KEEP in an IN subquery
+SELECT g FROM tg
+WHERE g IN (
+SELECT g FROM tk GROUP BY g
+HAVING SUM(v) KEEP (DENSE_RANK FIRST ORDER BY o NULLS LAST) > 40
+) ORDER BY g;
+g
+1
+# KEEP in an EXISTS subquery
+SELECT g FROM tg
+WHERE EXISTS (
+SELECT 1 FROM tk WHERE tk.g = tg.g GROUP BY tk.g
+HAVING COUNT(*) KEEP (DENSE_RANK FIRST ORDER BY o NULLS LAST) >= 2
+) ORDER BY g;
+g
+1
+# Outer references in KEEP's argument and ORDER BY
+SELECT tg.g,
+(SELECT SUM(tk.v + tg.g)
+KEEP (DENSE_RANK FIRST ORDER BY tk.o + tg.g NULLS LAST)
+FROM tk WHERE tk.g = tg.g) AS s
+FROM tg ORDER BY tg.g;
+g	s
+1	52
+2	42
+3	NULL
+SELECT tg.g,
+(SELECT SUM(tk.v)
+KEEP (DENSE_RANK FIRST ORDER BY tk.o + tg.g NULLS LAST)
+FROM tk WHERE tk.g = tg.g) AS s
+FROM tg ORDER BY tg.g;
+g	s
+1	50
+2	40
+3	NULL
+# Derived table containing subqueries inside KEEP
+SELECT * FROM (
+SELECT g, SUM((SELECT x FROM tlook WHERE tlook.id = tk.id))
+KEEP (DENSE_RANK FIRST ORDER BY o NULLS LAST) AS s
+FROM tk GROUP BY g
+) dt ORDER BY g;
+g	s
+1	500
+2	400
+3	600
+# CTE containing subqueries inside KEEP
+WITH cte AS (
+SELECT g, SUM((SELECT x FROM tlook WHERE tlook.id = tk.id))
+KEEP (DENSE_RANK FIRST ORDER BY o NULLS LAST) AS s
+FROM tk GROUP BY g
+)
+SELECT * FROM cte ORDER BY g;
+g	s
+1	500
+2	400
+3	600
+# View definition round-trip with a subquery inside KEEP
+CREATE VIEW vkeep_sub AS
+SELECT g, SUM((SELECT x FROM tlook WHERE tlook.id = tk.id))
+KEEP (DENSE_RANK FIRST ORDER BY o NULLS LAST) AS s
+FROM tk GROUP BY g;
+SELECT * FROM vkeep_sub ORDER BY g;
+g	s
+1	500
+2	400
+3	600
+SHOW CREATE VIEW vkeep_sub;
+View	Create View	character_set_client	collation_connection
+vkeep_sub	CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`localhost` SQL SECURITY DEFINER VIEW `vkeep_sub` AS select `tk`.`g` AS `g`,sum((select `tlook`.`x` from `tlook` where (`tlook`.`id` = `tk`.`id`))) KEEP (DENSE_RANK FIRST ORDER BY `tk`.`o` NULLS LAST) AS `s` from `tk` group by `tk`.`g`	utf8mb4	utf8mb4_0900_ai_ci
+DROP VIEW vkeep_sub;
+# Prepared statement containing a subquery inside KEEP
+PREPARE stmt FROM
+'SELECT g, SUM((SELECT x FROM tlook WHERE tlook.id = tk.id))
+          KEEP (DENSE_RANK FIRST ORDER BY o NULLS LAST) AS s
+   FROM tk GROUP BY g ORDER BY g';
+EXECUTE stmt;
+g	s
+1	500
+2	400
+3	600
+EXECUTE stmt;
+g	s
+1	500
+2	400
+3	600
+DEALLOCATE PREPARE stmt;
+# Window KEEP: subquery in the wrapped aggregate's argument
+SELECT id, g,
+SUM((SELECT x FROM tlook WHERE tlook.id = tk.id))
+KEEP (DENSE_RANK FIRST ORDER BY o NULLS LAST)
+OVER (PARTITION BY g) AS s
+FROM tk ORDER BY id;
+id	g	s
+1	1	500
+2	1	500
+3	1	500
+4	2	400
+5	2	400
+6	3	600
+# Window KEEP: subquery in KEEP's ORDER BY
+SELECT id, g,
+SUM(v) KEEP (DENSE_RANK FIRST ORDER BY
+(SELECT x FROM tlook WHERE tlook.id = tk.id) NULLS LAST)
+OVER (PARTITION BY g) AS s
+FROM tk ORDER BY id;
+id	g	s
+1	1	10
+2	1	10
+3	1	10
+4	2	40
+5	2	40
+6	3	NULL
+# Window KEEP: subquery in PARTITION BY
+SELECT id, g,
+SUM(v) KEEP (DENSE_RANK FIRST ORDER BY o NULLS LAST)
+OVER (PARTITION BY (SELECT x FROM tlook WHERE tlook.id = tk.id)) AS s
+FROM tk ORDER BY id;
+id	g	s
+1	1	10
+2	1	20
+3	1	30
+4	2	40
+5	2	50
+6	3	NULL
+# ROLLUP with a subquery inside KEEP
+SELECT g, SUM((SELECT x FROM tlook WHERE tlook.id = tk.id))
+KEEP (DENSE_RANK FIRST ORDER BY o NULLS LAST) AS s
+FROM tk GROUP BY g WITH ROLLUP ORDER BY g;
+g	s
+NULL	500
+1	500
+2	400
+3	600
+SELECT g, SUM(v) KEEP (DENSE_RANK FIRST ORDER BY
+(SELECT x FROM tlook WHERE tlook.id = tk.id) NULLS LAST) AS s
+FROM tk GROUP BY g WITH ROLLUP ORDER BY g;
+g	s
+NULL	10
+1	10
+2	40
+3	NULL
+# Multi-row subquery in KEEP's argument must fail
+SELECT SUM((SELECT x FROM tlook)) KEEP (DENSE_RANK FIRST ORDER BY o)
+FROM tk;
+ERROR 21000: Subquery returns more than 1 row
+# Multi-row subquery in KEEP's ORDER BY must fail
+SELECT SUM(v) KEEP (DENSE_RANK FIRST ORDER BY (SELECT x FROM tlook))
+FROM tk;
+ERROR 21000: Subquery returns more than 1 row
+DROP TABLE tk, tlook, tg;

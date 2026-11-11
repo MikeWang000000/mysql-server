@@ -461,7 +461,8 @@ class Item_sum : public Item_func {
     FIRST_LAST_VALUE_FUNC,
     NTH_VALUE_FUNC,
     ROLLUP_SUM_SWITCHER_FUNC,
-    GEOMETRY_AGGREGATE_FUNC
+    GEOMETRY_AGGREGATE_FUNC,
+    KEEP_FUNC             // Oracle-compatible KEEP (DENSE_RANK ...)
   };
 
   /**
@@ -492,6 +493,13 @@ class Item_sum : public Item_func {
       max_sum_func_level;  ///< max level of aggregation for contained functions
   bool allow_group_via_temp_table;  ///< If incremental update of fields is
                                     ///< supported.
+  /**
+    True for the aggregate wrapped by Item_sum_keep. Such an aggregate is not
+    a normal nested aggregate: it is evaluated by its Item_sum_keep owner and
+    must not be registered as an independent aggregate function. It is still
+    contextualized so that ROLLUP can create one copy per grouping level.
+  */
+  bool wrapped_by_keep_func{false};
   /**
     WFs are forbidden when resolving Item_sum; this member is used to restore
     WF allowance status afterwards.
@@ -1492,6 +1500,90 @@ class Item_sum_std : public Item_sum_variance {
 
 // This class is a string or number function depending on num_func
 class Arg_comparator;
+
+/**
+  Oracle-compatible KEEP (DENSE_RANK FIRST|LAST ORDER BY ...) aggregate.
+
+  This item wraps an ordinary aggregate (m_item_sum) and evaluates it only
+  over the rows whose ORDER BY values are the best (FIRST) or worst (LAST)
+  ones in the group. DENSE_RANK peers, i.e. rows with equal ORDER BY values,
+  are all aggregated.
+
+  The outer argument array contains, in order:
+    - the arguments of the wrapped aggregate, and
+    - the ORDER BY expressions.
+
+  m_order entries reference the ORDER BY slots in that array, so they follow
+  argument substitution (e.g. temporary table fields) automatically.
+*/
+class Item_sum_keep final : public Item_sum {
+  /// The aggregate function wrapped by KEEP.
+  Item_sum *m_item_sum{nullptr};
+  /// Number of leading args[] entries that belong to m_item_sum.
+  uint m_item_sum_arg_count{0};
+  /// True for DENSE_RANK FIRST, false for DENSE_RANK LAST.
+  bool m_first{false};
+  /// Whether the best ORDER BY values have been stored for this group.
+  bool m_have_best{false};
+  /// True once the wrapped aggregate's Aggregator has been set up.
+  bool m_inner_aggr_ready{false};
+
+  /// ORDER BY expressions, with item pointers into args[].
+  Mem_root_array<ORDER> m_order;
+  /// Cache of the current row's ORDER BY values.
+  Mem_root_array<Item_cache *> m_cur_values;
+  /// Cache of the best ORDER BY values seen so far.
+  Mem_root_array<Item_cache *> m_best_values;
+  /// Comparators for the ORDER BY expressions.
+  Mem_root_array<Arg_comparator *> m_comparators;
+
+  bool setup_order_comparators();
+  bool cache_current_order_values();
+  bool store_best_order_values();
+  int compare_order_values();
+
+ public:
+  Item_sum_keep(const POS &pos, Item_sum *inner, PT_order_list *order,
+                bool first, PT_window *window);
+  Item_sum_keep(THD *thd, const Item_sum_keep *item);
+
+  enum Sumfunctype sum_func() const override { return KEEP_FUNC; }
+  enum Item_result result_type() const override {
+    return m_item_sum->result_type();
+  }
+  const char *func_name() const override { return "keep"; }
+  bool keep_field_type() const override {
+    return m_item_sum->keep_field_type();
+  }
+
+  bool itemize(Parse_context *pc, Item **res) override;
+  bool fix_fields(THD *thd, Item **ref) override;
+  bool resolve_type(THD *thd) override;
+  bool setup(THD *thd) override;
+  void cleanup() override;
+  void clear() override;
+  bool add() override;
+  void no_rows_in_result() override;
+  void split_sum_func(THD *thd, Ref_item_array ref_item_array,
+                      mem_root_deque<Item *> *fields) override;
+  Item *set_arg(THD *thd, uint i, Item *new_val) override;
+  Item *copy_or_same(THD *thd) override;
+  Field *create_tmp_field(bool group, TABLE *table) override;
+  void reset_field() override;
+  void update_field() override;
+  void print(const THD *thd, String *str,
+             enum_query_type query_type) const override;
+  bool eq(const Item *item, bool binary_cmp) const override;
+
+  bool is_null() override { return m_item_sum->is_null(); }
+  double val_real() override;
+  longlong val_int() override;
+  String *val_str(String *str) override;
+  my_decimal *val_decimal(my_decimal *decimal_value) override;
+  bool get_date(MYSQL_TIME *ltime, my_time_flags_t fuzzydate) override;
+  bool get_time(MYSQL_TIME *ltime) override;
+  bool val_json(Json_wrapper *wr) override;
+};
 
 /**
   Abstract base class for the MIN and MAX aggregate functions.

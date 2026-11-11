@@ -321,6 +321,19 @@ struct ORDER {
   table_map used{0}, depend_map{0};
   bool is_position{false}; /* An item expresses a position in a ORDER clause */
   bool is_explicit{false}; /* Whether ASC/DESC is explicitly specified */
+  /**
+    Whether NULLS FIRST/LAST was explicitly specified in this ORDER element.
+    Only used by the KEEP (DENSE_RANK ...) clause.
+  */
+  bool nulls_specified{false};
+  /**
+    Whether NULLs sort first. Only used by the KEEP (DENSE_RANK ...) clause.
+    When nulls_specified is false, the KEEP parser sets this according to the
+    current mode: Oracle-compatible mode uses ASC => NULLS LAST and
+    DESC => NULLS FIRST; MySQL native mode uses ASC => NULLS FIRST and
+    DESC => NULLS LAST.
+  */
+  bool nulls_first{false};
 };
 
 /**

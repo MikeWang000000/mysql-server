@@ -2774,6 +2774,12 @@ class THD : public MDL_context_owner,
     return (variables.sql_mode &
             (MODE_STRICT_TRANS_TABLES | MODE_STRICT_ALL_TABLES));
   }
+  /**
+    Whether Oracle-compatible SQL semantics are enabled.
+  */
+  inline bool is_oracle_compatible_mode() const {
+    return DBUG_EVALUATE_IF("oracle_compatible_mode", true, false);
+  }
   inline const CHARSET_INFO *collation() {
     return variables.collation_server ? variables.collation_server
                                       : default_charset_info;

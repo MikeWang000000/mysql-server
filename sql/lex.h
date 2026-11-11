@@ -347,6 +347,7 @@ static const SYMBOL symbols[] = {
     {SYM("JSON", JSON_SYM)},
     {SYM("JSON_TABLE", JSON_TABLE_SYM)},
     {SYM("JSON_VALUE", JSON_VALUE_SYM)},
+    {SYM("KEEP", KEEP_SYM)},
     {SYM("KEY", KEY_SYM)},
     {SYM("KEYRING", KEYRING_SYM)},
     {SYM("KEYS", KEYS)},

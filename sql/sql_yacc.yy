@@ -1358,6 +1358,7 @@ void warn_about_deprecated_binary(THD *thd)
 %token<lexer.keyword> ST_COLLECT_SYM 1189                      /* MYSQL */
 
 %token<lexer.keyword> KEYRING_SYM 1190                         /* MYSQL */
+%token  KEEP_SYM 1191                                          /* MYSQL */
 /*
   Precedence rules used to resolve the ambiguity when using keywords as idents
   in the case e.g.:
@@ -1491,6 +1492,7 @@ void warn_about_deprecated_binary(THD *thd)
         opt_profile_defs
         profile_defs
         profile_def
+        keep_rank_dir opt_keep_nulls_position
 
 %type <ulonglong_number>
         ulonglong_num real_ulonglong_num size_number
@@ -1504,7 +1506,7 @@ void warn_about_deprecated_binary(THD *thd)
 %type <item>
         literal insert_ident temporal_literal
         simple_ident expr opt_expr opt_else
-        set_function_specification sum_expr
+        set_function_specification sum_expr keep_sum_expr
         in_sum_expr grouping_operation
         window_func_call opt_ll_default
         variable variable_aux bool_pri
@@ -1683,11 +1685,12 @@ void warn_about_deprecated_binary(THD *thd)
         index_hints_list opt_index_hints_list opt_key_definition
         opt_cache_key_list
 
-%type <order_expr> order_expr alter_order_item
+%type <order_expr> order_expr alter_order_item keep_order_expr
         grouping_expr
 
 %type <order_list> order_list group_list gorder_list opt_gorder_clause
       alter_order_list opt_partition_clause opt_window_order_by_clause
+      keep_order_list
 
 %type <c_str> field_length opt_field_length type_datetime_precision
         opt_place
@@ -1723,6 +1726,7 @@ void warn_about_deprecated_binary(THD *thd)
 %type <window> window_definition window_spec window_spec_details window_name_or_spec
   windowing_clause   ///< Definition of unnamed window near the window function.
   opt_windowing_clause ///< For functions which can be either set or window
+  keep_windowing_clause ///< OVER clause of an Oracle KEEP window function
                        ///< functions (e.g. SUM), non-empty clause makes the difference.
 
 %type <window_frame> opt_window_frame_clause
@@ -10982,6 +10986,18 @@ udf_expr:
 set_function_specification:
           sum_expr
         | grouping_operation
+        | keep_sum_expr KEEP_SYM '(' DENSE_RANK_SYM keep_rank_dir
+              ORDER_SYM BY keep_order_list ')'
+          {
+            $$= NEW_PTN Item_sum_keep(@$, down_cast<Item_sum *>($1), $8, $5,
+                                      nullptr);
+          }
+        | keep_sum_expr KEEP_SYM '(' DENSE_RANK_SYM keep_rank_dir
+              ORDER_SYM BY keep_order_list ')' keep_windowing_clause
+          {
+            $$= NEW_PTN Item_sum_keep(@$, down_cast<Item_sum *>($1), $8, $5,
+                                      $10);
+          }
         ;
 
 sum_expr:
@@ -11096,6 +11112,125 @@ sum_expr:
           ')' opt_windowing_clause
           {
             $$= NEW_PTN Item_func_group_concat(@$, $3, $4, $5, $6, $8);
+          }
+        ;
+
+/*
+  Aggregate functions that may be followed by a KEEP (DENSE_RANK ...) clause.
+
+  Only the functions accepted by the KEEP implementation are listed here.
+  The wrapped aggregate keeps the ordinary MySQL semantics: STD_SYM covers
+  STD/STDDEV/STDDEV_POP and VARIANCE_SYM covers VARIANCE/VAR_POP, all with
+  sample = 0 (population semantics).
+*/
+keep_sum_expr:
+          AVG_SYM '(' in_sum_expr ')'
+          {
+            $$= NEW_PTN Item_sum_avg(@$, $3, false, nullptr);
+          }
+        | COUNT_SYM '(' opt_all '*' ')'
+          {
+            $$= NEW_PTN PTI_count_sym(@$, nullptr);
+          }
+        | COUNT_SYM '(' in_sum_expr ')'
+          {
+            $$= NEW_PTN Item_sum_count(@$, $3, nullptr);
+          }
+        | MIN_SYM '(' in_sum_expr ')'
+          {
+            $$= NEW_PTN Item_sum_min(@$, $3, nullptr);
+          }
+        | MAX_SYM '(' in_sum_expr ')'
+          {
+            $$= NEW_PTN Item_sum_max(@$, $3, nullptr);
+          }
+        | SUM_SYM '(' in_sum_expr ')'
+          {
+            $$= NEW_PTN Item_sum_sum(@$, $3, false, nullptr);
+          }
+        | STD_SYM '(' in_sum_expr ')'
+          {
+            $$= NEW_PTN Item_sum_std(@$, $3, 0, nullptr);
+          }
+        | VARIANCE_SYM '(' in_sum_expr ')'
+          {
+            $$= NEW_PTN Item_sum_variance(@$, $3, 0, nullptr);
+          }
+        ;
+
+keep_rank_dir:
+          FIRST_SYM  { $$= 1; }
+        | LAST_SYM   { $$= 0; }
+        ;
+
+opt_keep_nulls_position:
+          /* empty */               { $$= 0; }
+        | NULLS_SYM FIRST_SYM       { $$= 1; }
+        | NULLS_SYM LAST_SYM        { $$= 2; }
+        ;
+
+keep_order_list:
+          keep_order_list ',' keep_order_expr
+          {
+            $1->push_back($3);
+            $$= $1;
+          }
+        | keep_order_expr
+          {
+            $$= NEW_PTN PT_order_list();
+            if ($$ == NULL)
+              MYSQL_YYABORT;
+            $$->push_back($1);
+          }
+        ;
+
+keep_order_expr:
+          expr opt_ordering_direction opt_keep_nulls_position
+          {
+            $$= NEW_PTN PT_order_expr($1, $2);
+            if ($$ == NULL)
+              MYSQL_YYABORT;
+            /*
+              NULLS FIRST/LAST is an absolute position, independent of
+              ASC/DESC. If it is omitted, the default depends on the mode:
+              - Oracle-compatible: ASC => NULLS LAST, DESC => NULLS FIRST;
+              - MySQL native: ASC => NULLS FIRST, DESC => NULLS LAST.
+            */
+            const bool is_desc = ($2 == ORDER_DESC);
+            $$->nulls_specified = ($3 != 0);
+            if ($3 == 1)
+              $$->nulls_first = true;
+            else if ($3 == 2)
+              $$->nulls_first = false;
+            else
+              $$->nulls_first = YYTHD->is_oracle_compatible_mode() ? is_desc
+                                                                   : !is_desc;
+          }
+        ;
+
+/*
+  Oracle allows only a query partition clause after KEEP: no window ORDER BY,
+  no frame specification, no named window and no window inheritance.
+  Rejecting those at the syntactic level also guarantees that the frame is
+  always the whole partition, which lets Window use the static aggregates
+  code path and avoids having to support frame inversion for KEEP.
+*/
+keep_windowing_clause:
+          OVER_SYM '(' opt_partition_clause ')'
+          {
+            PT_border *start_bound =
+                NEW_PTN PT_border(WBT_UNBOUNDED_PRECEDING);
+            PT_border *end_bound =
+                NEW_PTN PT_border(WBT_UNBOUNDED_FOLLOWING);
+            if (start_bound == nullptr || end_bound == nullptr)
+              MYSQL_YYABORT;
+            PT_borders *bounds = NEW_PTN PT_borders(start_bound, end_bound);
+            if (bounds == nullptr) MYSQL_YYABORT;
+            PT_frame *frame = NEW_PTN PT_frame(WFU_RANGE, bounds, nullptr);
+            if (frame == nullptr) MYSQL_YYABORT;
+            frame->m_originally_absent = true;
+            $$= NEW_PTN PT_window($3, nullptr, frame);
+            if ($$ == nullptr) MYSQL_YYABORT;
           }
         ;
 

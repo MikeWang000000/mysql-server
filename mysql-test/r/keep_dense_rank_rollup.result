@@ -1,0 +1,475 @@
+#
+# KEEP combined with MySQL GROUP BY ... WITH ROLLUP
+# Oracle equivalent syntax is GROUP BY ROLLUP(...)
+#
+CREATE TABLE t (a INT, b INT, c INT, d INT);
+INSERT INTO t VALUES
+(1, 10, 1, 1),
+(1, 20, 2, 1),
+(1, 30, 2, 2),
+(2, 40, 1, 1),
+(2, 50, NULL, 2),
+(3, NULL, 3, 1),
+(3, 60, 3, 2),
+(4, 70, NULL, 1);
+# Grouped KEEP: single-column rollup
+SELECT a, SUM(b) KEEP (DENSE_RANK FIRST ORDER BY c) AS s
+FROM t GROUP BY a WITH ROLLUP ORDER BY a;
+a	s
+NULL	120
+1	10
+2	50
+3	60
+4	70
+SELECT a, SUM(b) KEEP (DENSE_RANK LAST ORDER BY c) AS s
+FROM t GROUP BY a WITH ROLLUP ORDER BY a;
+a	s
+NULL	60
+1	50
+2	40
+3	60
+4	70
+# Grouped KEEP: multi-column rollup
+SELECT a, d, SUM(b) KEEP (DENSE_RANK FIRST ORDER BY c) AS s
+FROM t GROUP BY a, d WITH ROLLUP ORDER BY a, d;
+a	d	s
+NULL	NULL	120
+1	NULL	10
+1	1	10
+1	2	30
+2	NULL	50
+2	1	40
+2	2	50
+3	NULL	60
+3	1	NULL
+3	2	60
+4	NULL	70
+4	1	70
+SELECT a, d, SUM(b) KEEP (DENSE_RANK LAST ORDER BY c) AS s
+FROM t GROUP BY a, d WITH ROLLUP ORDER BY a, d;
+a	d	s
+NULL	NULL	60
+1	NULL	50
+1	1	20
+1	2	30
+2	NULL	40
+2	1	40
+2	2	50
+3	NULL	60
+3	1	NULL
+3	2	60
+4	NULL	70
+4	1	70
+# All aggregate functions, MySQL semantics for STDDEV/VARIANCE
+SELECT a,
+MIN(b) KEEP (DENSE_RANK FIRST ORDER BY c) AS mn,
+MAX(b) KEEP (DENSE_RANK FIRST ORDER BY c) AS mx,
+SUM(b) KEEP (DENSE_RANK FIRST ORDER BY c) AS sm,
+AVG(b) KEEP (DENSE_RANK FIRST ORDER BY c) AS av,
+COUNT(b) KEEP (DENSE_RANK FIRST ORDER BY c) AS cnt,
+COUNT(*) KEEP (DENSE_RANK FIRST ORDER BY c) AS cnt_star,
+STDDEV(b) KEEP (DENSE_RANK FIRST ORDER BY c) AS sd,
+VARIANCE(b) KEEP (DENSE_RANK FIRST ORDER BY c) AS var
+FROM t GROUP BY a WITH ROLLUP ORDER BY a;
+a	mn	mx	sm	av	cnt	cnt_star	sd	var
+NULL	50	70	120	60.0000	2	2	10	100
+1	10	10	10	10.0000	1	1	0	0
+2	50	50	50	50.0000	1	1	0	0
+3	60	60	60	60.0000	1	2	0	0
+4	70	70	70	70.0000	1	1	0	0
+# GROUPING() in SELECT / HAVING / ORDER BY
+SELECT a, d, GROUPING(a) AS ga, GROUPING(d) AS gd,
+SUM(b) KEEP (DENSE_RANK FIRST ORDER BY c) AS s
+FROM t GROUP BY a, d WITH ROLLUP ORDER BY a, d;
+a	d	ga	gd	s
+NULL	NULL	1	1	120
+1	NULL	0	1	10
+1	1	0	0	10
+1	2	0	0	30
+2	NULL	0	1	50
+2	1	0	0	40
+2	2	0	0	50
+3	NULL	0	1	60
+3	1	0	0	NULL
+3	2	0	0	60
+4	NULL	0	1	70
+4	1	0	0	70
+SELECT a, d, SUM(b) KEEP (DENSE_RANK FIRST ORDER BY c) AS s
+FROM t GROUP BY a, d WITH ROLLUP
+HAVING GROUPING(a) = 1 ORDER BY a, d;
+a	d	s
+NULL	NULL	120
+SELECT a, d, SUM(b) KEEP (DENSE_RANK FIRST ORDER BY c) AS s
+FROM t GROUP BY a, d WITH ROLLUP
+ORDER BY GROUPING(a), a, d;
+a	d	s
+1	NULL	10
+1	1	10
+1	2	30
+2	NULL	50
+2	1	40
+2	2	50
+3	NULL	60
+3	1	NULL
+3	2	60
+4	NULL	70
+4	1	70
+NULL	NULL	120
+# KEEP in an expression, ORDER BY and HAVING
+SELECT a, ROUND(AVG(b) KEEP (DENSE_RANK FIRST ORDER BY c), 2) + 1 AS av
+FROM t GROUP BY a WITH ROLLUP ORDER BY a;
+a	av
+NULL	61.00
+1	11.00
+2	51.00
+3	61.00
+4	71.00
+SELECT a, SUM(b) AS s
+FROM t GROUP BY a WITH ROLLUP
+ORDER BY SUM(b) KEEP (DENSE_RANK FIRST ORDER BY c) DESC;
+a	s
+NULL	280
+4	70
+3	60
+2	90
+1	60
+SELECT a, SUM(b) KEEP (DENSE_RANK FIRST ORDER BY c) AS s
+FROM t GROUP BY a WITH ROLLUP
+HAVING SUM(b) KEEP (DENSE_RANK FIRST ORDER BY c) > 40 ORDER BY a;
+a	s
+NULL	120
+2	50
+3	60
+4	70
+# Three rollup columns
+SELECT a, d, c, SUM(b) KEEP (DENSE_RANK FIRST ORDER BY c) AS s
+FROM t GROUP BY a, d, c WITH ROLLUP ORDER BY a, d, c;
+a	d	c	s
+NULL	NULL	NULL	120
+1	NULL	NULL	10
+1	1	NULL	10
+1	1	1	10
+1	1	2	20
+1	2	NULL	30
+1	2	2	30
+2	NULL	NULL	50
+2	1	NULL	40
+2	1	1	40
+2	2	NULL	50
+2	2	NULL	50
+3	NULL	NULL	60
+3	1	NULL	NULL
+3	1	3	NULL
+3	2	NULL	60
+3	2	3	60
+4	NULL	NULL	70
+4	1	NULL	70
+4	1	NULL	70
+# SQL_BIG_RESULT
+SELECT SQL_BIG_RESULT a, SUM(b) KEEP (DENSE_RANK FIRST ORDER BY c) AS s
+FROM t GROUP BY a WITH ROLLUP ORDER BY a;
+a	s
+NULL	120
+1	10
+2	50
+3	60
+4	70
+# Prepared statement, executed twice
+PREPARE stmt FROM
+'SELECT a, d, SUM(b) KEEP (DENSE_RANK FIRST ORDER BY c) AS s
+   FROM t GROUP BY a, d WITH ROLLUP ORDER BY a, d';
+EXECUTE stmt;
+a	d	s
+NULL	NULL	120
+1	NULL	10
+1	1	10
+1	2	30
+2	NULL	50
+2	1	40
+2	2	50
+3	NULL	60
+3	1	NULL
+3	2	60
+4	NULL	70
+4	1	70
+EXECUTE stmt;
+a	d	s
+NULL	NULL	120
+1	NULL	10
+1	1	10
+1	2	30
+2	NULL	50
+2	1	40
+2	2	50
+3	NULL	60
+3	1	NULL
+3	2	60
+4	NULL	70
+4	1	70
+DEALLOCATE PREPARE stmt;
+# Derived table, view, CTAS
+SELECT * FROM (
+SELECT a, d, SUM(b) KEEP (DENSE_RANK FIRST ORDER BY c) AS s
+FROM t GROUP BY a, d WITH ROLLUP
+) dt ORDER BY a, d;
+a	d	s
+NULL	NULL	120
+1	NULL	10
+1	1	10
+1	2	30
+2	NULL	50
+2	1	40
+2	2	50
+3	NULL	60
+3	1	NULL
+3	2	60
+4	NULL	70
+4	1	70
+CREATE VIEW vkeep_rollup AS
+SELECT a, d, SUM(b) KEEP (DENSE_RANK FIRST ORDER BY c) AS s
+FROM t GROUP BY a, d WITH ROLLUP;
+SELECT * FROM vkeep_rollup ORDER BY a, d;
+a	d	s
+NULL	NULL	120
+1	NULL	10
+1	1	10
+1	2	30
+2	NULL	50
+2	1	40
+2	2	50
+3	NULL	60
+3	1	NULL
+3	2	60
+4	NULL	70
+4	1	70
+SHOW CREATE VIEW vkeep_rollup;
+View	Create View	character_set_client	collation_connection
+vkeep_rollup	CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`localhost` SQL SECURITY DEFINER VIEW `vkeep_rollup` AS select `t`.`a` AS `a`,`t`.`d` AS `d`,sum(`t`.`b`) KEEP (DENSE_RANK FIRST ORDER BY `t`.`c`) AS `s` from `t` group by `t`.`a`,`t`.`d` with rollup	utf8mb4	utf8mb4_0900_ai_ci
+DROP VIEW vkeep_rollup;
+CREATE TABLE tctas AS
+SELECT a, d, SUM(b) KEEP (DENSE_RANK FIRST ORDER BY c) AS s
+FROM t GROUP BY a, d WITH ROLLUP;
+SELECT * FROM tctas ORDER BY a, d;
+a	d	s
+NULL	NULL	120
+1	NULL	10
+1	1	10
+1	2	30
+2	NULL	50
+2	1	40
+2	2	50
+3	NULL	60
+3	1	NULL
+3	2	60
+4	NULL	70
+4	1	70
+SHOW CREATE TABLE tctas;
+Table	Create Table
+tctas	CREATE TABLE `tctas` (
+  `a` int DEFAULT NULL,
+  `d` int DEFAULT NULL,
+  `s` decimal(32,0) DEFAULT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+DROP TABLE tctas;
+# Empty input
+SELECT a, SUM(b) KEEP (DENSE_RANK FIRST ORDER BY c) AS s
+FROM t WHERE 1 = 0 GROUP BY a WITH ROLLUP ORDER BY a;
+a	s
+# Window KEEP over rollup output rows
+SELECT a, d, SUM(SUM(b)) KEEP (DENSE_RANK FIRST ORDER BY MAX(c))
+OVER (PARTITION BY a) AS s
+FROM t GROUP BY a, d WITH ROLLUP ORDER BY a, d;
+a	d	s
+NULL	NULL	280
+1	NULL	120
+1	1	120
+1	2	120
+2	NULL	50
+2	1	50
+2	2	50
+3	NULL	120
+3	1	120
+3	2	120
+4	NULL	140
+4	1	140
+SELECT a, d, SUM(SUM(b)) KEEP (DENSE_RANK LAST ORDER BY MAX(c))
+OVER (PARTITION BY a) AS s
+FROM t GROUP BY a, d WITH ROLLUP ORDER BY a, d;
+a	d	s
+NULL	NULL	280
+1	NULL	120
+1	1	120
+1	2	120
+2	NULL	130
+2	1	130
+2	2	130
+3	NULL	120
+3	1	120
+3	2	120
+4	NULL	140
+4	1	140
+SELECT a, SUM(SUM(b)) KEEP (DENSE_RANK FIRST ORDER BY MAX(c)) OVER () AS s
+FROM t GROUP BY a WITH ROLLUP ORDER BY a;
+a	s
+NULL	70
+1	70
+2	70
+3	70
+4	70
+SELECT a, d, SUM(SUM(b)) KEEP (DENSE_RANK FIRST ORDER BY MAX(c))
+OVER (PARTITION BY GROUPING(a)) AS s
+FROM t GROUP BY a, d WITH ROLLUP ORDER BY a, d;
+a	d	s
+NULL	NULL	280
+1	NULL	190
+1	1	190
+1	2	190
+2	NULL	190
+2	1	190
+2	2	190
+3	NULL	190
+3	1	190
+3	2	190
+4	NULL	190
+4	1	190
+# GROUPING() is allowed inside window KEEP arguments
+SELECT a, d,
+SUM(GROUPING(a)) KEEP (DENSE_RANK FIRST ORDER BY MAX(c))
+OVER (PARTITION BY a) AS s
+FROM t GROUP BY a, d WITH ROLLUP ORDER BY a, d;
+a	d	s
+NULL	NULL	1
+1	NULL	0
+1	1	0
+1	2	0
+2	NULL	0
+2	1	0
+2	2	0
+3	NULL	0
+3	1	0
+3	2	0
+4	NULL	0
+4	1	0
+SELECT a, d,
+SUM(SUM(b)) KEEP (DENSE_RANK FIRST ORDER BY GROUPING(a))
+OVER (PARTITION BY a) AS s
+FROM t GROUP BY a, d WITH ROLLUP ORDER BY a, d;
+a	d	s
+NULL	NULL	280
+1	NULL	120
+1	1	120
+1	2	120
+2	NULL	180
+2	1	180
+2	2	180
+3	NULL	120
+3	1	120
+3	2	120
+4	NULL	140
+4	1	140
+# Window KEEP together with another window function
+SELECT a, d,
+ROW_NUMBER() OVER (PARTITION BY a ORDER BY d) AS rn,
+SUM(SUM(b)) KEEP (DENSE_RANK FIRST ORDER BY MAX(c))
+OVER (PARTITION BY a) AS s
+FROM t GROUP BY a, d WITH ROLLUP ORDER BY a, d;
+a	d	rn	s
+NULL	NULL	1	280
+1	NULL	1	120
+1	1	2	120
+1	2	3	120
+2	NULL	1	50
+2	1	2	50
+2	2	3	50
+3	NULL	1	120
+3	1	2	120
+3	2	3	120
+4	NULL	1	140
+4	1	2	140
+# Window KEEP prepared twice, view and CTAS
+PREPARE stmt2 FROM
+'SELECT a, SUM(SUM(b)) KEEP (DENSE_RANK FIRST ORDER BY MAX(c))
+          OVER (PARTITION BY a) AS s
+   FROM t GROUP BY a WITH ROLLUP ORDER BY a';
+EXECUTE stmt2;
+a	s
+NULL	280
+1	60
+2	90
+3	60
+4	70
+EXECUTE stmt2;
+a	s
+NULL	280
+1	60
+2	90
+3	60
+4	70
+DEALLOCATE PREPARE stmt2;
+CREATE VIEW vkeep_rollup_win AS
+SELECT a, d,
+SUM(SUM(b)) KEEP (DENSE_RANK FIRST ORDER BY MAX(c))
+OVER (PARTITION BY a) AS s
+FROM t GROUP BY a, d WITH ROLLUP;
+SELECT * FROM vkeep_rollup_win ORDER BY a, d;
+a	d	s
+NULL	NULL	280
+1	NULL	120
+1	1	120
+1	2	120
+2	NULL	50
+2	1	50
+2	2	50
+3	NULL	120
+3	1	120
+3	2	120
+4	NULL	140
+4	1	140
+SHOW CREATE VIEW vkeep_rollup_win;
+View	Create View	character_set_client	collation_connection
+vkeep_rollup_win	CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`localhost` SQL SECURITY DEFINER VIEW `vkeep_rollup_win` AS select `t`.`a` AS `a`,`t`.`d` AS `d`,sum(sum(`t`.`b`)) KEEP (DENSE_RANK FIRST ORDER BY max(`t`.`c`)) OVER (PARTITION BY `t`.`a` )  AS `s` from `t` group by `t`.`a`,`t`.`d` with rollup	utf8mb4	utf8mb4_0900_ai_ci
+DROP VIEW vkeep_rollup_win;
+CREATE TABLE tctas_win AS
+SELECT a, d,
+SUM(SUM(b)) KEEP (DENSE_RANK FIRST ORDER BY MAX(c))
+OVER (PARTITION BY a) AS s
+FROM t GROUP BY a, d WITH ROLLUP;
+SELECT * FROM tctas_win ORDER BY a, d;
+a	d	s
+NULL	NULL	280
+1	NULL	120
+1	1	120
+1	2	120
+2	NULL	50
+2	1	50
+2	2	50
+3	NULL	120
+3	1	120
+3	2	120
+4	NULL	140
+4	1	140
+SHOW CREATE TABLE tctas_win;
+Table	Create Table
+tctas_win	CREATE TABLE `tctas_win` (
+  `a` int DEFAULT NULL,
+  `d` int DEFAULT NULL,
+  `s` decimal(54,0) DEFAULT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+DROP TABLE tctas_win;
+# Oracle-style GROUP BY ROLLUP() remains a syntax error
+SELECT a, SUM(b) KEEP (DENSE_RANK FIRST ORDER BY c) AS s
+FROM t GROUP BY ROLLUP(a);
+ERROR 42000: You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near '(a)' at line 2
+# GROUPING() is not allowed in grouped KEEP arguments or ORDER BY
+SELECT a, SUM(b) KEEP (DENSE_RANK FIRST ORDER BY GROUPING(a)) AS s
+FROM t GROUP BY a WITH ROLLUP;
+ERROR HY000: Invalid use of group function
+SELECT a, SUM(GROUPING(a)) KEEP (DENSE_RANK FIRST ORDER BY c) AS s
+FROM t GROUP BY a WITH ROLLUP;
+ERROR HY000: Invalid use of group function
+# Ungrouped references in the window form keep the usual grouping error
+SELECT a, SUM(b) KEEP (DENSE_RANK FIRST ORDER BY c)
+OVER (PARTITION BY a) AS s
+FROM t GROUP BY a WITH ROLLUP;
+ERROR 42000: Expression #2 of SELECT list is not in GROUP BY clause and contains nonaggregated column 'test.t.b' which is not functionally dependent on columns in GROUP BY clause; this is incompatible with sql_mode=only_full_group_by
+DROP TABLE t;

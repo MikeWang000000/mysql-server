@@ -90,6 +90,15 @@ using std::max;
 using std::min;
 
 bool Item_sum::itemize(Parse_context *pc, Item **res) {
+  if (wrapped_by_keep_func) {
+    /*
+      The aggregate wrapped by Item_sum_keep is not part of the Item tree:
+      the owner itemizes its arguments and registers the KEEP function.
+      Contextualize this item only, so that copy_or_same() can be used when
+      GROUP BY ... WITH ROLLUP builds one copy per grouping level.
+    */
+    return Item::itemize(pc, res);
+  }
   if (skip_itemize(res)) return false;
   if (Item_result_field::itemize(pc, res)) return true;
 
@@ -150,6 +159,25 @@ ulonglong Item_sum::ram_limitation(THD *thd) {
 */
 
 bool Item_sum::init_sum_func_check(THD *thd) {
+  if (wrapped_by_keep_func) {
+    /*
+      This is the aggregate wrapped by Item_sum_keep. It is not a separate
+      containing set function: its arguments are already part of the owner's
+      argument list, and the owner is responsible for its evaluation.
+      Initialize the context fields, but keep LEX::in_sum_func unchanged.
+    */
+    save_deny_window_func = thd->lex->m_deny_window_func;
+    in_sum_func = thd->lex->in_sum_func;
+    base_query_block = thd->lex->current_query_block();
+    aggr_query_block = nullptr;
+    referenced_by[0] = nullptr;
+    if (base_query_block->first_execution) referenced_by[1] = nullptr;
+    max_aggr_level = -1;
+    max_sum_func_level = -1;
+    used_tables_cache = 0;
+    return false;
+  }
+
   if (m_is_window_function) {
     /*
       Are either no aggregates of any kind allowed at this level, or
@@ -244,6 +272,21 @@ bool Item_sum::init_sum_func_check(THD *thd) {
 
 bool Item_sum::check_sum_func(THD *thd, Item **ref) {
   DBUG_TRACE;
+
+  if (wrapped_by_keep_func) {
+    /*
+      The aggregate wrapped by Item_sum_keep is aggregated together with its
+      owner, in the owner's query block. It must not participate in the
+      nested-aggregate level checks, nor be linked into
+      Query_block::inner_sum_func_list (only the owner is).
+    */
+    assert(aggr_query_block == nullptr);
+    aggr_query_block = base_query_block;
+    update_used_tables();
+    thd->lex->in_sum_func = in_sum_func;
+    thd->lex->m_deny_window_func = save_deny_window_func;
+    return false;
+  }
 
   if (m_is_window_function) {
     update_used_tables();
@@ -426,6 +469,7 @@ Item_sum::Item_sum(THD *thd, const Item_sum *item)
       base_query_block(item->base_query_block),
       aggr_query_block(item->aggr_query_block),
       allow_group_via_temp_table(item->allow_group_via_temp_table),
+      wrapped_by_keep_func(item->wrapped_by_keep_func),
       forced_const(item->forced_const) {
   assert(arg_count == item->arg_count);
   with_distinct = item->with_distinct;
@@ -2563,6 +2607,540 @@ Item *Item_sum_variance::copy_or_same(THD *thd) {
   Item *result = m_is_window_function ? this
                                       : new (thd->mem_root)
                                             Item_sum_variance(thd, this);
+  return result;
+}
+
+/**
+  Constructor for the Oracle-compatible KEEP aggregate.
+
+  @param pos    Parser position.
+  @param inner  Aggregate function whose value is restricted to the peer rows
+                with the best (FIRST) or worst (LAST) ORDER BY values.
+  @param order  ORDER BY list of the KEEP clause.
+  @param first  true for DENSE_RANK FIRST, false for DENSE_RANK LAST.
+  @param window Window of an Oracle KEEP window function. nullptr for the
+                plain grouped form: KEEP (DENSE_RANK ...)
+*/
+Item_sum_keep::Item_sum_keep(const POS &pos, Item_sum *inner,
+                             PT_order_list *order, bool first,
+                             PT_window *window)
+    : Item_sum(pos, window),
+      m_item_sum(inner),
+      m_item_sum_arg_count(inner != nullptr ? inner->arg_count : 0),
+      m_first(first),
+      m_order(*THR_MALLOC),
+      m_cur_values(*THR_MALLOC),
+      m_best_values(*THR_MALLOC),
+      m_comparators(*THR_MALLOC) {
+  // KEEP state cannot be serialized into a grouping temporary table.
+  allow_group_via_temp_table = false;
+
+  if (m_item_sum == nullptr) return;
+
+  m_item_sum->wrapped_by_keep_func = true;
+
+  /*
+    args[]: [0, N) = inner aggregate arguments,
+            [N, N + M) = KEEP ORDER BY expressions.
+  */
+  const uint order_count = (order != nullptr) ? order->value.elements : 0;
+  arg_count = m_item_sum_arg_count + order_count;
+  if (arg_count == 0) return;
+
+  args = (*THR_MALLOC)->ArrayAlloc<Item *>(arg_count);
+  if (args == nullptr) {
+    arg_count = 0;
+    return;
+  }
+
+  if (m_order.reserve(order_count)) {
+    args = nullptr; // OOM
+    arg_count = 0;
+    return;
+  }
+
+  // Copy ORDER nodes and put their items into args[] slots.
+  uint arg_pos = m_item_sum_arg_count;
+  for (ORDER *o = order != nullptr ? order->value.first : nullptr; o != nullptr;
+       o = o->next) {
+    if (m_order.push_back(*o)) {
+      args = nullptr; // OOM
+      arg_count = 0;
+      return;
+    }
+    args[arg_pos] = *o->item;
+    m_order.back().item = &args[arg_pos];
+    arg_pos++;
+  }
+
+  for (uint i = 0; i < m_order.size(); i++)
+    m_order[i].next = (i + 1 < m_order.size()) ? &m_order[i + 1] : nullptr;
+}
+
+/// Copy constructor, used when grouping through a temporary table.
+Item_sum_keep::Item_sum_keep(THD *thd, const Item_sum_keep *item)
+    : Item_sum(thd, item),
+      m_item_sum_arg_count(item->m_item_sum_arg_count),
+      m_first(item->m_first),
+      m_order(thd->mem_root),
+      m_cur_values(thd->mem_root),
+      m_best_values(thd->mem_root),
+      m_comparators(thd->mem_root) {
+  allow_group_via_temp_table = false;
+
+  if (item->m_item_sum != nullptr) {
+    m_item_sum = down_cast<Item_sum *>(item->m_item_sum->copy_or_same(thd));
+    if (m_item_sum != nullptr) {
+      m_item_sum->wrapped_by_keep_func = true;
+      /*
+        The copied inner aggregate initially refers to the original owner's
+        argument array. Point it at this object's arguments instead.
+      */
+      for (uint i = 0; i < m_item_sum_arg_count; i++)
+        m_item_sum->set_arg_resolve(thd, i, args[i]);
+    }
+  }
+
+  if (m_order.reserve(item->m_order.size())) return;
+
+  for (uint i = 0; i < item->m_order.size(); i++) {
+    if (m_order.push_back(item->m_order[i])) return;
+    m_order.back().item = &args[m_item_sum_arg_count + i];
+  }
+
+  for (uint i = 0; i < m_order.size(); i++)
+    m_order[i].next = (i + 1 < m_order.size()) ? &m_order[i + 1] : nullptr;
+}
+
+bool Item_sum_keep::itemize(Parse_context *pc, Item **res) {
+  if (m_item_sum == nullptr || args == nullptr) {
+    my_error(ER_OUTOFMEMORY, MYF(0), static_cast<int>(sizeof(Item *)));
+    return true;
+  }
+
+  Item *inner_ref = m_item_sum;
+  if (m_item_sum->itemize(pc, &inner_ref)) return true;
+
+  // The args[] layout assumes the inner argument count stays fixed.
+  assert(m_item_sum->arg_count == m_item_sum_arg_count);
+
+  /*
+    Copy the arguments only after itemizing the wrapped aggregate, so that
+    any parser-time placeholders have been resolved.
+  */
+  for (uint i = 0; i < m_item_sum_arg_count; i++)
+    args[i] = m_item_sum->arguments()[i];
+
+  if (Item_sum::itemize(pc, res)) return true;
+
+  /*
+    Item_sum::itemize() may have replaced args[i] while resolving placeholders,
+    so propagate the final pointers to the wrapped aggregate.
+  */
+  for (uint i = 0; i < m_item_sum_arg_count; i++)
+    m_item_sum->set_arg_resolve(pc->thd, i, args[i]);
+  return false;
+}
+
+bool Item_sum_keep::fix_fields(THD *thd, Item **ref) {
+  assert(fixed == 0);
+
+  if (m_item_sum == nullptr || args == nullptr) {
+    my_error(ER_OUTOFMEMORY, MYF(0), static_cast<int>(sizeof(Item *)));
+    return true;
+  }
+
+  if (Item_sum::fix_fields(thd, ref)) return true;
+  if (init_sum_func_check(thd)) return true;
+
+  Condition_context CCT(thd->lex->current_query_block());
+
+  set_nullable(false);
+
+  for (uint i = 0; i < arg_count; i++) {
+    if ((!args[i]->fixed && args[i]->fix_fields(thd, args + i)) ||
+        args[i]->check_cols(1))
+      return true;
+    set_nullable(is_nullable() || args[i]->is_nullable());
+  }
+
+  /*
+    GROUPING() is not allowed in the arguments or ORDER BY of a grouped KEEP
+    when ROLLUP is used: Oracle reports ORA-00934. The window form of KEEP
+    allows it, so only the non-window form is checked here.
+  */
+  if (!m_is_window_function && base_query_block->olap == ROLLUP_TYPE) {
+    for (uint i = 0; i < arg_count; i++) {
+      if (args[i]->has_grouping_func()) {
+        my_error(ER_INVALID_GROUP_FUNC_USE, MYF(0));
+        return true;
+      }
+    }
+  }
+
+  /*
+    Keep the wrapped aggregate's argument pointers in sync with any
+    replacements done while resolving the outer arguments.
+  */
+  for (uint i = 0; i < m_item_sum_arg_count; i++)
+    m_item_sum->set_arg_resolve(thd, i, args[i]);
+
+  if (m_item_sum->fix_fields(thd, &args[0])) return true;
+
+  if (resolve_type(thd)) return true;
+  if (check_sum_func(thd, ref)) return true;
+
+  /*
+    Now that all ORDER BY expressions have their final types, build the
+    value caches and comparators.
+  */
+  if (setup_order_comparators()) return true;
+
+  fixed = true;
+  return false;
+}
+
+bool Item_sum_keep::resolve_type(THD *) {
+  set_data_type_from_item(m_item_sum);
+  set_nullable(m_item_sum->is_nullable());
+  null_value = true;
+  return false;
+}
+
+bool Item_sum_keep::setup_order_comparators() {
+  if (!m_comparators.empty()) return false;
+
+  const size_t count = m_order.size();
+  if (count == 0) return false;
+
+  if (m_cur_values.reserve(count) || m_best_values.reserve(count) ||
+      m_comparators.reserve(count))
+    return true;
+
+  for (size_t i = 0; i < count; i++) {
+    Item *expr = *m_order[i].item;
+    Item_cache *cur = Item_cache::get_cache(expr);
+    Item_cache *best = Item_cache::get_cache(expr);
+    Arg_comparator *cmp = new (*THR_MALLOC) Arg_comparator();
+    if (cur == nullptr || best == nullptr || cmp == nullptr) return true;
+    if (cur->setup(expr) || best->setup(expr)) return true;
+
+    if (m_cur_values.push_back(cur) || m_best_values.push_back(best) ||
+        m_comparators.push_back(cmp))
+      return true;
+
+    /*
+      NULL is handled explicitly by compare_order_values(), so ask the
+      comparator not to interpret NULLs (and not to modify our null_value).
+    */
+    if (cmp->set_cmp_func(this, pointer_cast<Item **>(&m_cur_values[i]),
+                          pointer_cast<Item **>(&m_best_values[i]), false))
+      return true;
+  }
+  return false;
+}
+
+bool Item_sum_keep::cache_current_order_values() {
+  for (size_t i = 0; i < m_order.size(); i++) {
+    m_cur_values[i]->store(*m_order[i].item);
+    m_cur_values[i]->cache_value();
+    if (current_thd->is_error()) return true;
+  }
+  return false;
+}
+
+bool Item_sum_keep::store_best_order_values() {
+  for (size_t i = 0; i < m_order.size(); i++) {
+    m_best_values[i]->store(m_cur_values[i]);
+    m_best_values[i]->cache_value();
+    if (current_thd->is_error()) return true;
+  }
+  return false;
+}
+
+/**
+  Compare the current row's ORDER BY values with the best ones seen so far.
+  @return negative if current is better in ascending order, 0 for a peer,
+          positive otherwise. DESC is applied per column.
+*/
+int Item_sum_keep::compare_order_values() {
+  for (size_t i = 0; i < m_order.size(); i++) {
+    const bool cur_is_null = m_cur_values[i]->null_value;
+    const bool best_is_null = m_best_values[i]->null_value;
+
+    /*
+      NULLS FIRST/LAST specifies an absolute position in the final ordering,
+      independent of ASC/DESC. Therefore the NULL comparison below is not
+      inverted for DESC; only comparisons of two non-NULL values are.
+    */
+    if (cur_is_null || best_is_null) {
+      if (cur_is_null && best_is_null) continue;
+      return cur_is_null ? (m_order[i].nulls_first ? -1 : 1)
+                         : (m_order[i].nulls_first ? 1 : -1);
+    }
+
+    int cmp = m_comparators[i]->compare();
+    if (m_order[i].direction == ORDER_DESC) cmp = -cmp;
+    if (cmp != 0) return cmp;
+  }
+  return 0;
+}
+
+bool Item_sum_keep::add() {
+  /*
+    Window functions do not go through setup_sum_funcs(), so the wrapped
+    aggregate has no Aggregator yet. Create it on first use.
+  */
+  if (m_is_window_function && !m_inner_aggr_ready) {
+    if (m_item_sum->set_aggregator(Aggregator::SIMPLE_AGGREGATOR)) return true;
+    if (m_item_sum->aggregator_setup(current_thd)) return true;
+    m_inner_aggr_ready = true;
+  }
+
+  if (m_cur_values.empty() && setup_order_comparators()) return true;
+
+  if (!m_have_best) {
+    if (cache_current_order_values()) return true;
+    if (store_best_order_values()) return true;
+    m_have_best = true;
+    return m_item_sum->reset_and_add();
+  }
+
+  if (cache_current_order_values()) return true;
+
+  const int cmp = compare_order_values();
+  if (m_first ? cmp < 0 : cmp > 0) {
+    if (store_best_order_values()) return true;
+    return m_item_sum->reset_and_add();
+  }
+
+  // DENSE_RANK peers all contribute to the wrapped aggregate.
+  if (cmp == 0) return m_item_sum->add();
+
+  // This row ranks worse; ignore it.
+  return false;
+}
+
+bool Item_sum_keep::setup(THD *thd) {
+  if (setup_order_comparators()) return true;
+
+  if (m_item_sum->set_aggregator(Aggregator::SIMPLE_AGGREGATOR)) return true;
+  if (m_item_sum->aggregator_setup(thd)) return true;
+  m_inner_aggr_ready = true;
+  return false;
+}
+
+void Item_sum_keep::clear() {
+  if (m_item_sum != nullptr) m_item_sum->clear();
+
+  m_have_best = false;
+  for (size_t i = 0; i < m_best_values.size(); i++)
+    m_best_values[i]->clear();
+
+  null_value = true;
+}
+
+void Item_sum_keep::cleanup() {
+  if (m_item_sum != nullptr) m_item_sum->cleanup();
+  m_have_best = false;
+  m_inner_aggr_ready = false;
+  /*
+    Drop the caches/comparators: if the statement is re-prepared, the ORDER BY
+    expressions may have been replaced. They are rebuilt by fix_fields().
+  */
+  m_cur_values.clear();
+  m_best_values.clear();
+  m_comparators.clear();
+  Item_sum::cleanup();
+}
+
+void Item_sum_keep::no_rows_in_result() {
+  m_item_sum->no_rows_in_result();
+  null_value = m_item_sum->null_value;
+}
+
+Item *Item_sum_keep::set_arg(THD *thd, uint i, Item *new_val) {
+  thd->change_item_tree(args + i, new_val);
+  if (i < m_item_sum_arg_count) {
+    // Keep the wrapped aggregate's argument in sync.
+    thd->change_item_tree(m_item_sum->get_arg_ptr(i), new_val);
+  }
+  return new_val;
+}
+
+void Item_sum_keep::split_sum_func(THD *thd, Ref_item_array ref_item_array,
+                                   mem_root_deque<Item *> *fields) {
+  Item_sum::split_sum_func(thd, ref_item_array, fields);
+  /*
+    Aggregates used as arguments to a window function are replaced with
+    references during split_sum_func(). The wrapped aggregate is not part of
+    args[], so update its argument pointers explicitly.
+  */
+  if (m_item_sum != nullptr) {
+    for (uint i = 0; i < m_item_sum_arg_count; i++)
+      m_item_sum->set_arg_resolve(thd, i, args[i]);
+  }
+}
+
+Item *Item_sum_keep::copy_or_same(THD *thd) {
+  if (m_is_window_function) return this;
+  return new (thd->mem_root) Item_sum_keep(thd, this);
+}
+
+Field *Item_sum_keep::create_tmp_field(bool group, TABLE *table) {
+  /*
+    Let the wrapped aggregate create the field, since it knows how to preserve
+    DATE/TIME/JSON and other special result types. The field name, however,
+    must come from the KEEP expression: the wrapped aggregate was created
+    inside the parser action and has no user-visible name.
+  */
+  Item_name_string saved_name = m_item_sum->item_name;
+  m_item_sum->item_name = item_name;
+  Field *field = m_item_sum->create_tmp_field(group, table);
+  m_item_sum->item_name = saved_name;
+  return field;
+}
+
+void Item_sum_keep::reset_field() {
+  // allow_group_via_temp_table is false, so this must never be called.
+  assert(false);
+}
+
+void Item_sum_keep::update_field() {
+  // allow_group_via_temp_table is false, so this must never be called.
+  assert(false);
+}
+
+void Item_sum_keep::print(const THD *thd, String *str,
+                          enum_query_type query_type) const {
+  str->append(m_item_sum->func_name());
+  str->append('(');
+  for (uint i = 0; i < m_item_sum_arg_count; i++) {
+    if (i) str->append(',');
+    args[i]->print(thd, str, query_type);
+  }
+  str->append(STRING_WITH_LEN(") KEEP (DENSE_RANK "));
+  str->append(m_first ? "FIRST" : "LAST", m_first ? 5 : 4);
+  str->append(STRING_WITH_LEN(" ORDER BY "));
+
+  for (size_t i = 0; i < m_order.size(); i++) {
+    if (i) str->append(',');
+    (*m_order[i].item)->print(thd, str, query_type);
+    if (m_order[i].direction == ORDER_DESC)
+      str->append(STRING_WITH_LEN(" DESC"));
+    if (m_order[i].nulls_specified) {
+      str->append(STRING_WITH_LEN(" NULLS "));
+      str->append(m_order[i].nulls_first ? "FIRST" : "LAST",
+                  m_order[i].nulls_first ? 5 : 4);
+    }
+  }
+  str->append(')');
+
+  if (m_window != nullptr) {
+    str->append(STRING_WITH_LEN(" OVER "));
+    m_window->print(thd, str, query_type, false);
+  }
+}
+
+bool Item_sum_keep::eq(const Item *item, bool binary_cmp) const {
+  if (item == this) return true;
+  if (item->type() != type()) return false;
+
+  const Item_sum *item_sum = down_cast<const Item_sum *>(item);
+  if (item_sum->sum_func() != KEEP_FUNC) return false;
+
+  const Item_sum_keep *other = down_cast<const Item_sum_keep *>(item);
+  if (m_item_sum->sum_func() != other->m_item_sum->sum_func() ||
+      m_first != other->m_first ||
+      m_item_sum_arg_count != other->m_item_sum_arg_count ||
+      m_order.size() != other->m_order.size())
+    return false;
+
+  if (!Item_sum::eq(item, binary_cmp)) return false;
+
+  for (size_t i = 0; i < m_order.size(); i++) {
+    if (m_order[i].direction != other->m_order[i].direction ||
+        m_order[i].nulls_first != other->m_order[i].nulls_first ||
+        m_order[i].nulls_specified != other->m_order[i].nulls_specified)
+      return false;
+  }
+  return true;
+}
+
+double Item_sum_keep::val_real() {
+  assert(fixed == 1);
+  if (m_is_window_function) {
+    if (wf_common_init()) return 0.0;
+    if (add()) return 0.0;
+  }
+  const double result = m_item_sum->val_real();
+  null_value = m_item_sum->null_value;
+  return result;
+}
+
+longlong Item_sum_keep::val_int() {
+  assert(fixed == 1);
+  if (m_is_window_function) {
+    if (wf_common_init()) return 0;
+    if (add()) return 0;
+  }
+  const longlong result = m_item_sum->val_int();
+  null_value = m_item_sum->null_value;
+  return result;
+}
+
+String *Item_sum_keep::val_str(String *str) {
+  assert(fixed == 1);
+  if (m_is_window_function) {
+    if (wf_common_init()) return nullptr;
+    if (add()) return nullptr;
+  }
+  String *result = m_item_sum->val_str(str);
+  null_value = m_item_sum->null_value;
+  return result;
+}
+
+my_decimal *Item_sum_keep::val_decimal(my_decimal *decimal_value) {
+  assert(fixed == 1);
+  if (m_is_window_function) {
+    if (wf_common_init()) return nullptr;
+    if (add()) return nullptr;
+  }
+  my_decimal *result = m_item_sum->val_decimal(decimal_value);
+  null_value = m_item_sum->null_value;
+  return result;
+}
+
+bool Item_sum_keep::get_date(MYSQL_TIME *ltime, my_time_flags_t fuzzydate) {
+  assert(fixed == 1);
+  if (m_is_window_function) {
+    if (wf_common_init()) return true;
+    if (add()) return true;
+  }
+  const bool result = m_item_sum->get_date(ltime, fuzzydate);
+  null_value = m_item_sum->null_value;
+  return result;
+}
+
+bool Item_sum_keep::get_time(MYSQL_TIME *ltime) {
+  assert(fixed == 1);
+  if (m_is_window_function) {
+    if (wf_common_init()) return true;
+    if (add()) return true;
+  }
+  const bool result = m_item_sum->get_time(ltime);
+  null_value = m_item_sum->null_value;
+  return result;
+}
+
+bool Item_sum_keep::val_json(Json_wrapper *wr) {
+  assert(fixed == 1);
+  if (m_is_window_function) {
+    if (wf_common_init()) return false;  // NULL
+    if (add()) return current_thd->is_error();
+  }
+  const bool result = m_item_sum->val_json(wr);
+  null_value = m_item_sum->null_value;
   return result;
 }
 
