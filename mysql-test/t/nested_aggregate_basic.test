@@ -1,0 +1,238 @@
+--echo #
+--echo # Oracle-compatible nested aggregates, e.g. SUM(SUM(x)).
+--echo #
+--echo # A nested aggregate is evaluated in two stages: the inner aggregate is
+--echo # computed per GROUP BY group (together with WHERE and HAVING filtering),
+--echo # and the outer aggregate is then computed over those group rows,
+--echo # producing a single result row.
+--echo #
+--echo # MySQL implements this by rewriting the query into a derived table.
+--echo #
+--echo # The inner derived table query block takes:
+--echo #   - FROM and WHERE, i.e. base-table row filtering;
+--echo #   - GROUP BY and the inner aggregates;
+--echo #   - HAVING, i.e. group filtering before the outer aggregates;
+--echo #   - the arguments of the outer aggregates, lifted as derived columns.
+--echo #
+--echo # The outer query block keeps:
+--echo #   - the outer aggregates and expressions built on top of them;
+--echo #   - SELECT DISTINCT;
+--echo #   - LIMIT and OFFSET;
+--echo #   - the query-level ORDER BY, which is resolved and then removed
+--echo #     because the result is a single row.
+--echo #
+--echo # Example 1: plain nested aggregate with DISTINCT, LIMIT and OFFSET
+--echo #
+--echo #   SELECT DISTINCT SUM(SUM(v)) AS s
+--echo #   FROM t
+--echo #   WHERE h > 0
+--echo #   GROUP BY g
+--echo #   HAVING SUM(v) > 40
+--echo #   ORDER BY SUM(v)
+--echo #   LIMIT 1 OFFSET 1;
+--echo #
+--echo # is rewritten as:
+--echo #
+--echo #   SELECT DISTINCT SUM(`tmp_nested_1`) AS s
+--echo #   FROM (
+--echo #     SELECT SUM(v) AS `tmp_nested_1`
+--echo #     FROM t
+--echo #     WHERE h > 0
+--echo #     GROUP BY g
+--echo #     HAVING SUM(v) > 40
+--echo #   ) AS `derived_1_2`
+--echo #   LIMIT 1 OFFSET 1;
+--echo #
+--echo # In the rewritten form:
+--echo #   - the inner derived table owns the whole grouping process:
+--echo #     FROM, WHERE, GROUP BY, inner SUM(v) and HAVING;
+--echo #   - the outer aggregate SUM(SUM(v)) becomes SUM(tmp_nested_1), an
+--echo #     ordinary aggregate over one derived row per group;
+--echo #   - SELECT DISTINCT, LIMIT and OFFSET stay in the outer query block.
+--echo #     DISTINCT is redundant here because the result is a single row, and
+--echo #     may be removed by the optimizer. OFFSET applies to the final result
+--echo #     set, so OFFSET 1 skips the single result row and returns no rows;
+--echo #   - the query-level ORDER BY belongs to the outer query block as well,
+--echo #     but is removed because the result is a single row.
+--echo #
+--echo # Example 2: GROUP_CONCAT with its own ORDER BY
+--echo #
+--echo #   SELECT GROUP_CONCAT(SUM(v) ORDER BY SUM(v) DESC SEPARATOR '-') AS s
+--echo #   FROM t
+--echo #   WHERE h > 0
+--echo #   GROUP BY g
+--echo #   HAVING SUM(v) > 40;
+--echo #
+--echo # is rewritten as:
+--echo #
+--echo #   SELECT GROUP_CONCAT(`tmp_nested_1`
+--echo #                       ORDER BY `tmp_nested_2` DESC
+--echo #                       SEPARATOR '-') AS s
+--echo #   FROM (
+--echo #     SELECT SUM(v) AS `tmp_nested_1`,
+--echo #            SUM(v) AS `tmp_nested_2`
+--echo #     FROM t
+--echo #     WHERE h > 0
+--echo #     GROUP BY g
+--echo #     HAVING SUM(v) > 40
+--echo #   ) AS `derived_1_2`;
+--echo #
+--echo # The ORDER BY inside GROUP_CONCAT is not the query-level ORDER BY of
+--echo # example 1: it is part of GROUP_CONCAT's own ordering specification and
+--echo # sorts the group rows that GROUP_CONCAT consumes. Both the value
+--echo # expression and this internal ordering expression are arguments of the
+--echo # outer aggregate, so both are lifted as derived columns, and the internal
+--echo # ORDER BY keeps sorting the grouped rows inside the derived table.
+--echo #
+
+CREATE TABLE t (g INT, h INT, v INT, w INT);
+INSERT INTO t VALUES (1,1,10,1),(1,2,20,2),(2,3,30,3),(2,4,40,4),
+                     (3,5,NULL,5),(3,6,NULL,6),(4,7,50,NULL);
+CREATE TABLE empty_t (g INT, v INT);
+
+--echo #
+--echo # Basic semantics
+--echo #
+SELECT SUM(SUM(v)) FROM t GROUP BY g;
+SELECT COUNT(SUM(v)) FROM t GROUP BY g;
+SELECT AVG(SUM(v)) FROM t GROUP BY g;
+SELECT MIN(SUM(v)), MAX(SUM(v)) FROM t GROUP BY g;
+SELECT SUM(COUNT(*)) FROM t GROUP BY g;
+SELECT COUNT(COUNT(*)) FROM t GROUP BY g;
+SELECT SUM(SUM(v)+g) FROM t GROUP BY g;
+SELECT SUM(SUM(v)+1) FROM t GROUP BY g;
+SELECT SUM(SUM(v)*SUM(w)) FROM t GROUP BY g;
+SELECT SUM(SUM(v)+SUM(w)) FROM t GROUP BY g;
+SELECT SUM(SUM(v)+MOD(g,2)) FROM t GROUP BY g;
+SELECT SUM(SUM(v)+COUNT(*)) FROM t GROUP BY g;
+SELECT ROUND(SUM(SUM(v)),2) FROM t GROUP BY g;
+SELECT CASE WHEN SUM(SUM(v)) > 100 THEN 'big' ELSE 'small' END FROM t GROUP BY g;
+SELECT SUM(SUM(v)), COUNT(SUM(v)), SUM(SUM(w)) FROM t GROUP BY g;
+
+--echo #
+--echo # HAVING is evaluated on the grouping level, before the outer aggregate
+--echo #
+SELECT SUM(SUM(v)) FROM t GROUP BY g HAVING SUM(v) > 40;
+SELECT SUM(SUM(v)) FROM t GROUP BY g HAVING COUNT(*) > 1;
+SELECT SUM(SUM(v)) FROM t GROUP BY g HAVING g = 2;
+SELECT SUM(SUM(v)) FROM t GROUP BY g HAVING SUM(v) IS NULL;
+SELECT SUM(SUM(v)) FROM t GROUP BY g HAVING SUM(v)+1 > 41;
+SELECT SUM(SUM(v)) FROM t GROUP BY g HAVING g IN (1,2);
+SELECT SUM(SUM(v)) FROM t GROUP BY g HAVING SUM(v) > 40 AND g = 2;
+SELECT SUM(SUM(v)) FROM t GROUP BY g HAVING MOD(g,2) = 0;
+SELECT SUM(SUM(v)) FROM t GROUP BY g HAVING 1=0;
+
+--echo #
+--echo # ORDER BY is parsed and validated, then removed (single-row result)
+--echo #
+SELECT SUM(SUM(v)) FROM t GROUP BY g ORDER BY g;
+SELECT SUM(SUM(v)) FROM t GROUP BY g ORDER BY SUM(v);
+SELECT SUM(SUM(v)) FROM t GROUP BY g ORDER BY SUM(SUM(v));
+SELECT SUM(SUM(v)) FROM t GROUP BY g ORDER BY 1;
+SELECT SUM(SUM(v)) FROM t GROUP BY g ORDER BY SUM(v)+SUM(SUM(v));
+SELECT SUM(SUM(v)) FROM t GROUP BY g LIMIT 1;
+
+--echo #
+--echo # Empty input still produces one row
+--echo #
+SELECT SUM(SUM(v)) FROM empty_t GROUP BY g;
+SELECT COUNT(SUM(v)) FROM empty_t GROUP BY g;
+SELECT SUM(COUNT(*)) FROM empty_t GROUP BY g;
+SELECT COUNT(COUNT(*)) FROM empty_t GROUP BY g;
+SELECT AVG(SUM(v)) FROM empty_t GROUP BY g;
+SELECT SUM(SUM(v)) FROM empty_t GROUP BY g HAVING 1=0;
+
+--echo #
+--echo # DISTINCT
+--echo #
+SELECT SUM(DISTINCT SUM(v)) FROM t GROUP BY g;
+SELECT SUM(SUM(DISTINCT v)) FROM t GROUP BY g;
+SELECT COUNT(DISTINCT SUM(v)) FROM t GROUP BY g;
+
+--echo #
+--echo # Query-level DISTINCT and OFFSET stay in the outer query block
+--echo #
+SELECT DISTINCT SUM(SUM(v)) FROM t GROUP BY g;
+SELECT COUNT(*) FROM
+  (SELECT SUM(SUM(v)) FROM t GROUP BY g LIMIT 1 OFFSET 1) AS x;
+SELECT COUNT(*) FROM
+  (SELECT DISTINCT SUM(SUM(v)) FROM t GROUP BY g LIMIT 1 OFFSET 1) AS x;
+
+--echo #
+--echo # Multiple grouping columns and grouping expressions
+--echo #
+SELECT SUM(SUM(v)) FROM t GROUP BY g,h;
+SELECT SUM(SUM(v)) FROM t GROUP BY MOD(g,2);
+
+--echo #
+--echo # GROUP_CONCAT with its own ORDER BY
+--echo #
+SELECT GROUP_CONCAT(SUM(v) ORDER BY SUM(v)) FROM t GROUP BY g;
+SELECT GROUP_CONCAT(SUM(v) ORDER BY SUM(v) DESC) FROM t GROUP BY g;
+SELECT GROUP_CONCAT(SUM(v) ORDER BY g DESC) FROM t GROUP BY g;
+SELECT GROUP_CONCAT(SUM(v) ORDER BY SUM(v) DESC SEPARATOR '-') FROM t GROUP BY g;
+SELECT GROUP_CONCAT(DISTINCT SUM(v) ORDER BY SUM(v)) FROM t GROUP BY g;
+SELECT GROUP_CONCAT(SUM(v) ORDER BY SUM(v) DESC, g DESC) FROM t GROUP BY g;
+--error 1055
+SELECT GROUP_CONCAT(SUM(v) ORDER BY h) FROM t GROUP BY g;
+
+--echo #
+--echo # Nested aggregates must not change window function behavior
+--echo #
+SELECT g, SUM(SUM(v)) OVER () FROM t GROUP BY g ORDER BY g;
+SELECT g, SUM(SUM(v)) OVER (ORDER BY g) FROM t GROUP BY g ORDER BY g;
+
+--echo #
+--echo # Plain aggregation is unchanged
+--echo #
+SELECT g, SUM(v) FROM t GROUP BY g ORDER BY g;
+SELECT SUM(v) FROM t;
+
+--echo #
+--echo # Permanent errors (also in non-strict mode)
+--echo #
+--error 1111
+SELECT SUM(SUM(v)) FROM t;
+--error 1111
+SELECT SUM(SUM(SUM(v))) FROM t GROUP BY g;
+--error 1055
+SELECT g, SUM(SUM(v)) FROM t GROUP BY g;
+--error 1140
+SELECT SUM(SUM(v)), SUM(v) FROM t GROUP BY g;
+--error 1140
+SELECT SUM(SUM(v))*2 + COUNT(*) FROM t GROUP BY g;
+--error 1111
+SELECT SUM(SUM(v)) FROM t GROUP BY g HAVING SUM(SUM(v)) > 100;
+--error 1111
+SELECT SUM(SUM(v)) FROM t GROUP BY g HAVING AVG(SUM(v)) > 40;
+--error 3593
+SELECT SUM(SUM(v) OVER ()) FROM t GROUP BY g;
+--error 1054
+SELECT SUM(SUM(v)) FROM t GROUP BY g ORDER BY nonexistent;
+
+SET @save_sql_mode = @@sql_mode;
+SET sql_mode = '';
+
+--error 1055
+SELECT g, SUM(SUM(v)) FROM t GROUP BY g;
+--error 1055
+SELECT SUM(SUM(v)+h) FROM t GROUP BY g;
+
+SELECT SUM(SUM(v)) FROM t GROUP BY g;
+SELECT SUM(SUM(v)) FROM t GROUP BY g HAVING g = 2;
+
+SET sql_mode = @save_sql_mode;
+
+--echo #
+--echo # Unsupported combinations
+--echo #
+--error 1235
+SELECT SUM(SUM(v)), ROW_NUMBER() OVER () FROM t GROUP BY g;
+--error 1235
+SELECT SUM(SUM(v)), SUM(SUM(v)) OVER () FROM t GROUP BY g;
+--error 1235
+SELECT 1 FROM t GROUP BY g ORDER BY SUM(SUM(v));
+--error 1235
+SELECT SUM(SUM(v)) FROM t GROUP BY g WITH ROLLUP;
+
+DROP TABLE t, empty_t;

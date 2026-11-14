@@ -1725,6 +1725,9 @@ class Query_block {
 
   void set_json_agg_func_used(bool val) { m_json_agg_func_used = val; }
 
+  bool has_nested_aggregate() const { return m_has_nested_aggregate; }
+  void set_has_nested_aggregate(bool val) { m_has_nested_aggregate = val; }
+
   bool right_joins() const { return m_right_joins; }
   void set_right_joins() { m_right_joins = true; }
 
@@ -2222,6 +2225,7 @@ class Query_block {
   bool supported_correlated_scalar_subquery(THD *thd, Item::Css_info *subquery,
                                             Item **lifted_where);
   bool transform_grouped_to_derived(THD *thd, bool *break_off);
+  bool transform_nested_aggregates_to_derived(THD *thd);
   bool replace_subquery_in_expr(THD *thd, Item::Css_info *subquery,
                                 TABLE_LIST *tr, Item **expr);
   bool nest_derived(THD *thd, Item *join_cond,
@@ -2319,6 +2323,23 @@ class Query_block {
 
   bool m_agg_func_used{false};
   bool m_json_agg_func_used{false};
+
+  /**
+    True if this query block contains an outer nested aggregate, e.g.
+    SUM(SUM(x)), that must be rewritten into a derived table. Set by
+    Item_sum::check_sum_func().
+  */
+  bool m_has_nested_aggregate{false};
+
+  /// True if transform_nested_aggregates_to_derived() has been performed.
+  bool m_nested_aggregate_transformed{false};
+
+  /**
+    If true, apply ONLY_FULL_GROUP_BY checks even when the sql_mode does not
+    enable ONLY_FULL_GROUP_BY. Used for query blocks produced by nested
+    aggregate rewriting, where the grouping has been moved to a derived table.
+  */
+  bool m_force_full_group_by{false};
 
   /**
     True if query block does not generate any rows before aggregation,

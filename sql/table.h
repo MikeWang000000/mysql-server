@@ -295,6 +295,20 @@ struct ORDER {
    */
   Item **item{&item_initial};
 
+  /**
+    Make this ORDER element refer to the given expression directly, instead
+    of pointing into the select field list. Used when a GROUP BY list is moved
+    to a derived table, so that the moved elements survive removal of the
+    original select fields.
+  */
+  void set_item_to_expression(Item *expr) {
+    item_initial = expr;
+    item = &item_initial;
+    in_field_list = false;
+    is_position = false;
+    used_alias = false;
+  }
+
   Item_rollup_group_item *rollup_item{nullptr};
 
   enum_order direction{

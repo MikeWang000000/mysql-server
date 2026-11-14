@@ -1,0 +1,341 @@
+#
+# Oracle-compatible nested aggregates, e.g. SUM(SUM(x)).
+#
+# A nested aggregate is evaluated in two stages: the inner aggregate is
+# computed per GROUP BY group (together with WHERE and HAVING filtering),
+# and the outer aggregate is then computed over those group rows,
+# producing a single result row.
+#
+# MySQL implements this by rewriting the query into a derived table.
+#
+# The inner derived table query block takes:
+#   - FROM and WHERE, i.e. base-table row filtering;
+#   - GROUP BY and the inner aggregates;
+#   - HAVING, i.e. group filtering before the outer aggregates;
+#   - the arguments of the outer aggregates, lifted as derived columns.
+#
+# The outer query block keeps:
+#   - the outer aggregates and expressions built on top of them;
+#   - SELECT DISTINCT;
+#   - LIMIT and OFFSET;
+#   - the query-level ORDER BY, which is resolved and then removed
+#     because the result is a single row.
+#
+# Example 1: plain nested aggregate with DISTINCT, LIMIT and OFFSET
+#
+#   SELECT DISTINCT SUM(SUM(v)) AS s
+#   FROM t
+#   WHERE h > 0
+#   GROUP BY g
+#   HAVING SUM(v) > 40
+#   ORDER BY SUM(v)
+#   LIMIT 1 OFFSET 1;
+#
+# is rewritten as:
+#
+#   SELECT DISTINCT SUM(`tmp_nested_1`) AS s
+#   FROM (
+#     SELECT SUM(v) AS `tmp_nested_1`
+#     FROM t
+#     WHERE h > 0
+#     GROUP BY g
+#     HAVING SUM(v) > 40
+#   ) AS `derived_1_2`
+#   LIMIT 1 OFFSET 1;
+#
+# In the rewritten form:
+#   - the inner derived table owns the whole grouping process:
+#     FROM, WHERE, GROUP BY, inner SUM(v) and HAVING;
+#   - the outer aggregate SUM(SUM(v)) becomes SUM(tmp_nested_1), an
+#     ordinary aggregate over one derived row per group;
+#   - SELECT DISTINCT, LIMIT and OFFSET stay in the outer query block.
+#     DISTINCT is redundant here because the result is a single row, and
+#     may be removed by the optimizer. OFFSET applies to the final result
+#     set, so OFFSET 1 skips the single result row and returns no rows;
+#   - the query-level ORDER BY belongs to the outer query block as well,
+#     but is removed because the result is a single row.
+#
+# Example 2: GROUP_CONCAT with its own ORDER BY
+#
+#   SELECT GROUP_CONCAT(SUM(v) ORDER BY SUM(v) DESC SEPARATOR '-') AS s
+#   FROM t
+#   WHERE h > 0
+#   GROUP BY g
+#   HAVING SUM(v) > 40;
+#
+# is rewritten as:
+#
+#   SELECT GROUP_CONCAT(`tmp_nested_1`
+#                       ORDER BY `tmp_nested_2` DESC
+#                       SEPARATOR '-') AS s
+#   FROM (
+#     SELECT SUM(v) AS `tmp_nested_1`,
+#            SUM(v) AS `tmp_nested_2`
+#     FROM t
+#     WHERE h > 0
+#     GROUP BY g
+#     HAVING SUM(v) > 40
+#   ) AS `derived_1_2`;
+#
+# The ORDER BY inside GROUP_CONCAT is not the query-level ORDER BY of
+# example 1: it is part of GROUP_CONCAT's own ordering specification and
+# sorts the group rows that GROUP_CONCAT consumes. Both the value
+# expression and this internal ordering expression are arguments of the
+# outer aggregate, so both are lifted as derived columns, and the internal
+# ORDER BY keeps sorting the grouped rows inside the derived table.
+#
+CREATE TABLE t (g INT, h INT, v INT, w INT);
+INSERT INTO t VALUES (1,1,10,1),(1,2,20,2),(2,3,30,3),(2,4,40,4),
+(3,5,NULL,5),(3,6,NULL,6),(4,7,50,NULL);
+CREATE TABLE empty_t (g INT, v INT);
+#
+# Basic semantics
+#
+SELECT SUM(SUM(v)) FROM t GROUP BY g;
+SUM(SUM(v))
+150
+SELECT COUNT(SUM(v)) FROM t GROUP BY g;
+COUNT(SUM(v))
+3
+SELECT AVG(SUM(v)) FROM t GROUP BY g;
+AVG(SUM(v))
+50.0000
+SELECT MIN(SUM(v)), MAX(SUM(v)) FROM t GROUP BY g;
+MIN(SUM(v))	MAX(SUM(v))
+30	70
+SELECT SUM(COUNT(*)) FROM t GROUP BY g;
+SUM(COUNT(*))
+7
+SELECT COUNT(COUNT(*)) FROM t GROUP BY g;
+COUNT(COUNT(*))
+4
+SELECT SUM(SUM(v)+g) FROM t GROUP BY g;
+SUM(SUM(v)+g)
+157
+SELECT SUM(SUM(v)+1) FROM t GROUP BY g;
+SUM(SUM(v)+1)
+153
+SELECT SUM(SUM(v)*SUM(w)) FROM t GROUP BY g;
+SUM(SUM(v)*SUM(w))
+580
+SELECT SUM(SUM(v)+SUM(w)) FROM t GROUP BY g;
+SUM(SUM(v)+SUM(w))
+110
+SELECT SUM(SUM(v)+MOD(g,2)) FROM t GROUP BY g;
+SUM(SUM(v)+MOD(g,2))
+151
+SELECT SUM(SUM(v)+COUNT(*)) FROM t GROUP BY g;
+SUM(SUM(v)+COUNT(*))
+155
+SELECT ROUND(SUM(SUM(v)),2) FROM t GROUP BY g;
+ROUND(SUM(SUM(v)),2)
+150
+SELECT CASE WHEN SUM(SUM(v)) > 100 THEN 'big' ELSE 'small' END FROM t GROUP BY g;
+CASE WHEN SUM(SUM(v)) > 100 THEN 'big' ELSE 'small' END
+big
+SELECT SUM(SUM(v)), COUNT(SUM(v)), SUM(SUM(w)) FROM t GROUP BY g;
+SUM(SUM(v))	COUNT(SUM(v))	SUM(SUM(w))
+150	3	21
+#
+# HAVING is evaluated on the grouping level, before the outer aggregate
+#
+SELECT SUM(SUM(v)) FROM t GROUP BY g HAVING SUM(v) > 40;
+SUM(SUM(v))
+120
+SELECT SUM(SUM(v)) FROM t GROUP BY g HAVING COUNT(*) > 1;
+SUM(SUM(v))
+100
+SELECT SUM(SUM(v)) FROM t GROUP BY g HAVING g = 2;
+SUM(SUM(v))
+70
+SELECT SUM(SUM(v)) FROM t GROUP BY g HAVING SUM(v) IS NULL;
+SUM(SUM(v))
+NULL
+SELECT SUM(SUM(v)) FROM t GROUP BY g HAVING SUM(v)+1 > 41;
+SUM(SUM(v))
+120
+SELECT SUM(SUM(v)) FROM t GROUP BY g HAVING g IN (1,2);
+SUM(SUM(v))
+100
+SELECT SUM(SUM(v)) FROM t GROUP BY g HAVING SUM(v) > 40 AND g = 2;
+SUM(SUM(v))
+70
+SELECT SUM(SUM(v)) FROM t GROUP BY g HAVING MOD(g,2) = 0;
+SUM(SUM(v))
+120
+SELECT SUM(SUM(v)) FROM t GROUP BY g HAVING 1=0;
+SUM(SUM(v))
+NULL
+#
+# ORDER BY is parsed and validated, then removed (single-row result)
+#
+SELECT SUM(SUM(v)) FROM t GROUP BY g ORDER BY g;
+SUM(SUM(v))
+150
+SELECT SUM(SUM(v)) FROM t GROUP BY g ORDER BY SUM(v);
+SUM(SUM(v))
+150
+SELECT SUM(SUM(v)) FROM t GROUP BY g ORDER BY SUM(SUM(v));
+SUM(SUM(v))
+150
+SELECT SUM(SUM(v)) FROM t GROUP BY g ORDER BY 1;
+SUM(SUM(v))
+150
+SELECT SUM(SUM(v)) FROM t GROUP BY g ORDER BY SUM(v)+SUM(SUM(v));
+SUM(SUM(v))
+150
+SELECT SUM(SUM(v)) FROM t GROUP BY g LIMIT 1;
+SUM(SUM(v))
+150
+#
+# Empty input still produces one row
+#
+SELECT SUM(SUM(v)) FROM empty_t GROUP BY g;
+SUM(SUM(v))
+NULL
+SELECT COUNT(SUM(v)) FROM empty_t GROUP BY g;
+COUNT(SUM(v))
+0
+SELECT SUM(COUNT(*)) FROM empty_t GROUP BY g;
+SUM(COUNT(*))
+NULL
+SELECT COUNT(COUNT(*)) FROM empty_t GROUP BY g;
+COUNT(COUNT(*))
+0
+SELECT AVG(SUM(v)) FROM empty_t GROUP BY g;
+AVG(SUM(v))
+NULL
+SELECT SUM(SUM(v)) FROM empty_t GROUP BY g HAVING 1=0;
+SUM(SUM(v))
+NULL
+#
+# DISTINCT
+#
+SELECT SUM(DISTINCT SUM(v)) FROM t GROUP BY g;
+SUM(DISTINCT SUM(v))
+150
+SELECT SUM(SUM(DISTINCT v)) FROM t GROUP BY g;
+SUM(SUM(DISTINCT v))
+150
+SELECT COUNT(DISTINCT SUM(v)) FROM t GROUP BY g;
+COUNT(DISTINCT SUM(v))
+3
+#
+# Query-level DISTINCT and OFFSET stay in the outer query block
+#
+SELECT DISTINCT SUM(SUM(v)) FROM t GROUP BY g;
+SUM(SUM(v))
+150
+SELECT COUNT(*) FROM
+(SELECT SUM(SUM(v)) FROM t GROUP BY g LIMIT 1 OFFSET 1) AS x;
+COUNT(*)
+0
+SELECT COUNT(*) FROM
+(SELECT DISTINCT SUM(SUM(v)) FROM t GROUP BY g LIMIT 1 OFFSET 1) AS x;
+COUNT(*)
+0
+#
+# Multiple grouping columns and grouping expressions
+#
+SELECT SUM(SUM(v)) FROM t GROUP BY g,h;
+SUM(SUM(v))
+150
+SELECT SUM(SUM(v)) FROM t GROUP BY MOD(g,2);
+SUM(SUM(v))
+150
+#
+# GROUP_CONCAT with its own ORDER BY
+#
+SELECT GROUP_CONCAT(SUM(v) ORDER BY SUM(v)) FROM t GROUP BY g;
+GROUP_CONCAT(SUM(v) ORDER BY SUM(v))
+30,50,70
+SELECT GROUP_CONCAT(SUM(v) ORDER BY SUM(v) DESC) FROM t GROUP BY g;
+GROUP_CONCAT(SUM(v) ORDER BY SUM(v) DESC)
+70,50,30
+SELECT GROUP_CONCAT(SUM(v) ORDER BY g DESC) FROM t GROUP BY g;
+GROUP_CONCAT(SUM(v) ORDER BY g DESC)
+50,70,30
+SELECT GROUP_CONCAT(SUM(v) ORDER BY SUM(v) DESC SEPARATOR '-') FROM t GROUP BY g;
+GROUP_CONCAT(SUM(v) ORDER BY SUM(v) DESC SEPARATOR '-')
+70-50-30
+SELECT GROUP_CONCAT(DISTINCT SUM(v) ORDER BY SUM(v)) FROM t GROUP BY g;
+GROUP_CONCAT(DISTINCT SUM(v) ORDER BY SUM(v))
+30,50,70
+SELECT GROUP_CONCAT(SUM(v) ORDER BY SUM(v) DESC, g DESC) FROM t GROUP BY g;
+GROUP_CONCAT(SUM(v) ORDER BY SUM(v) DESC, g DESC)
+70,50,30
+SELECT GROUP_CONCAT(SUM(v) ORDER BY h) FROM t GROUP BY g;
+ERROR 42000: Expression #2 of SELECT list is not in GROUP BY clause and contains nonaggregated column 'test.t.h' which is not functionally dependent on columns in GROUP BY clause; this is incompatible with sql_mode=only_full_group_by
+#
+# Nested aggregates must not change window function behavior
+#
+SELECT g, SUM(SUM(v)) OVER () FROM t GROUP BY g ORDER BY g;
+g	SUM(SUM(v)) OVER ()
+1	150
+2	150
+3	150
+4	150
+SELECT g, SUM(SUM(v)) OVER (ORDER BY g) FROM t GROUP BY g ORDER BY g;
+g	SUM(SUM(v)) OVER (ORDER BY g)
+1	30
+2	100
+3	100
+4	150
+#
+# Plain aggregation is unchanged
+#
+SELECT g, SUM(v) FROM t GROUP BY g ORDER BY g;
+g	SUM(v)
+1	30
+2	70
+3	NULL
+4	50
+SELECT SUM(v) FROM t;
+SUM(v)
+150
+#
+# Permanent errors (also in non-strict mode)
+#
+SELECT SUM(SUM(v)) FROM t;
+ERROR HY000: Invalid use of group function
+SELECT SUM(SUM(SUM(v))) FROM t GROUP BY g;
+ERROR HY000: Invalid use of group function
+SELECT g, SUM(SUM(v)) FROM t GROUP BY g;
+ERROR 42000: 'test.t.g' isn't in GROUP BY
+SELECT SUM(SUM(v)), SUM(v) FROM t GROUP BY g;
+ERROR 42000: Mixing of GROUP columns (MIN(),MAX(),COUNT(),...) with no GROUP columns is illegal if there is no GROUP BY clause
+SELECT SUM(SUM(v))*2 + COUNT(*) FROM t GROUP BY g;
+ERROR 42000: Mixing of GROUP columns (MIN(),MAX(),COUNT(),...) with no GROUP columns is illegal if there is no GROUP BY clause
+SELECT SUM(SUM(v)) FROM t GROUP BY g HAVING SUM(SUM(v)) > 100;
+ERROR HY000: Invalid use of group function
+SELECT SUM(SUM(v)) FROM t GROUP BY g HAVING AVG(SUM(v)) > 40;
+ERROR HY000: Invalid use of group function
+SELECT SUM(SUM(v) OVER ()) FROM t GROUP BY g;
+ERROR HY000: You cannot use the window function 'sum' in this context.'
+SELECT SUM(SUM(v)) FROM t GROUP BY g ORDER BY nonexistent;
+ERROR 42S22: Unknown column 'nonexistent' in 'order clause'
+SET @save_sql_mode = @@sql_mode;
+SET sql_mode = '';
+SELECT g, SUM(SUM(v)) FROM t GROUP BY g;
+ERROR 42000: 'test.t.g' isn't in GROUP BY
+SELECT SUM(SUM(v)+h) FROM t GROUP BY g;
+ERROR 42000: Expression #1 of SELECT list is not in GROUP BY clause and contains nonaggregated column 'test.t.h' which is not functionally dependent on columns in GROUP BY clause; this is incompatible with sql_mode=only_full_group_by
+SELECT SUM(SUM(v)) FROM t GROUP BY g;
+SUM(SUM(v))
+150
+SELECT SUM(SUM(v)) FROM t GROUP BY g HAVING g = 2;
+SUM(SUM(v))
+70
+SET sql_mode = @save_sql_mode;
+#
+# Unsupported combinations
+#
+SELECT SUM(SUM(v)), ROW_NUMBER() OVER () FROM t GROUP BY g;
+ERROR 42000: This version of MySQL doesn't yet support 'nested aggregate functions with window functions'
+SELECT SUM(SUM(v)), SUM(SUM(v)) OVER () FROM t GROUP BY g;
+ERROR 42000: This version of MySQL doesn't yet support 'nested aggregate functions with window functions'
+SELECT 1 FROM t GROUP BY g ORDER BY SUM(SUM(v));
+ERROR 42000: This version of MySQL doesn't yet support 'nested aggregate functions in ORDER BY without them in the SELECT list'
+SELECT SUM(SUM(v)) FROM t GROUP BY g WITH ROLLUP;
+ERROR 42000: This version of MySQL doesn't yet support 'nested aggregate functions with WITH ROLLUP'
+DROP TABLE t, empty_t;

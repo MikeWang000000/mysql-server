@@ -493,6 +493,25 @@ class Item_sum : public Item_func {
   bool allow_group_via_temp_table;  ///< If incremental update of fields is
                                     ///< supported.
   /**
+    True if this aggregate function is the outer aggregate of a nested
+    aggregate expression whose inner aggregate is aggregated in the same query
+    block, e.g. the outer SUM in SUM(SUM(x)). Such an aggregate is rewritten
+    into a derived table by
+    Query_block::transform_nested_aggregates_to_derived().
+  */
+  bool m_nested_aggregate_outer{false};
+
+  /**
+    Maximum depth of same-query-block aggregate nesting found in this
+    aggregate's arguments. 0 for a plain aggregate, 1 for SUM(SUM(x)), 2 for
+    SUM(SUM(SUM(x))).
+  */
+  uint8 m_nested_depth{0};
+
+  bool is_nested_aggregate_outer() const { return m_nested_aggregate_outer; }
+  uint8 nested_depth() const { return m_nested_depth; }
+
+  /**
     WFs are forbidden when resolving Item_sum; this member is used to restore
     WF allowance status afterwards.
   */

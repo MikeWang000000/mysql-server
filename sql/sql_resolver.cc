@@ -399,6 +399,19 @@ bool Query_block::prepare(THD *thd, mem_root_deque<Item *> *insert_field_list) {
     added_new_sum_funcs = true;
   }
 
+  /*
+    Rewrite Oracle-style nested aggregates, e.g. SUM(SUM(x)), into an
+    aggregate over a derived table containing the grouping. This must happen
+    after ORDER BY has been resolved (so that name/type errors are still
+    reported) and before scalar subqueries are transformed. View analysis
+    keeps the original form so that SHOW CREATE VIEW shows the user's query;
+    the rewrite is done when the view is used.
+  */
+  if (m_has_nested_aggregate && !thd->lex->is_view_context_analysis() &&
+      !m_nested_aggregate_transformed &&
+      transform_nested_aggregates_to_derived(thd))
+    return true;
+
   thd->want_privilege = want_privilege_saved;
 
   if (is_distinct() && can_skip_distinct())
@@ -775,7 +788,8 @@ bool Query_block::apply_local_transforms(THD *thd, bool prune) {
     when the view is later used (SELECTed...)
   */
   if ((is_distinct() || is_grouped()) &&
-      (thd->variables.sql_mode & MODE_ONLY_FULL_GROUP_BY) &&
+      ((thd->variables.sql_mode & MODE_ONLY_FULL_GROUP_BY) ||
+       m_force_full_group_by) &&
       check_only_full_group_by(thd))
     return true;
 
@@ -6292,6 +6306,646 @@ bool Query_block::transform_grouped_to_derived(THD *thd, bool *break_off) {
                         "subquery over grouped derived table");
     opt_trace_print_expanded_query(thd, this, &trace_object);
   }  // Prepared_stmt_arena_holder scope
+  return false;
+}
+
+/**
+  An argument of an outer nested aggregate that must be moved down into the
+  derived table holding the grouping, e.g. the "SUM(x)+y" argument of the outer
+  SUM in SUM(SUM(x)+y).
+*/
+struct Nested_aggregate_argument {
+  Item_sum *m_outer;
+  uint m_arg_index;
+  Item *m_expr;
+  /// Name given to m_expr in the derived table's select list. The expression
+  /// may be replaced during resolution, so we identify it by name afterwards.
+  std::string m_name;
+};
+
+/// Reason why an expression in the SELECT list is not allowed in a query block
+/// being rewritten for nested aggregates.
+enum class Nested_agg_error {
+  NONE,
+  LOCAL_FIELD,
+  PLAIN_AGGREGATE,
+  WINDOW_FUNCTION,
+  GROUPING_FUNCTION
+};
+
+/**
+  Check an expression that will remain in the query block after nested
+  aggregates have been moved down to a derived table.
+
+  The walk descends into subexpressions, but stops at the arguments of an
+  outer nested aggregate, since those arguments are moved down together with
+  the aggregate. Subqueries are not inspected: they remain in place.
+
+  @param item     expression to check
+  @param select   query block that will be rewritten
+  @param outers   accumulator of outer nested aggregates found
+  @returns the kind of unsupported expression found, if any
+*/
+static Nested_agg_error check_nested_agg_select_expr(
+    Item *item, Query_block *select, std::vector<Item_sum *> *outers) {
+  switch (item->type()) {
+    case Item::SUM_FUNC_ITEM: {
+      Item_sum *sum = down_cast<Item_sum *>(item);
+      if (sum->m_is_window_function) return Nested_agg_error::WINDOW_FUNCTION;
+      if (sum->is_nested_aggregate_outer()) {
+        if (std::find(outers->begin(), outers->end(), sum) == outers->end())
+          outers->push_back(sum);
+        return Nested_agg_error::NONE;
+      }
+      return Nested_agg_error::PLAIN_AGGREGATE;
+    }
+    case Item::REF_ITEM: {
+      Item_ref *ref = down_cast<Item_ref *>(item);
+      if (ref->ref_type() != Item_ref::AGGREGATE_REF) {
+        /*
+          A plain reference (e.g. a field that split_sum_func() moved to the
+          hidden select list). Follow it so that local fields are detected.
+        */
+        if (ref->ref == nullptr || *ref->ref == nullptr || *ref->ref == item)
+          return Nested_agg_error::NONE;
+        return check_nested_agg_select_expr(*ref->ref, select, outers);
+      }
+      Item *target = ref->ref != nullptr ? *ref->ref : nullptr;
+      if (target == nullptr || target == item)
+        return Nested_agg_error::NONE;
+      if (target->type() != Item::SUM_FUNC_ITEM) {
+        /*
+          An aggregate reference can also point at a hidden non-aggregate
+          expression (e.g. a field that had to be moved to the hidden part of
+          the select list). Check it as a normal expression.
+        */
+        return check_nested_agg_select_expr(target, select, outers);
+      }
+      Item_sum *sum = down_cast<Item_sum *>(target);
+      if (!sum->is_nested_aggregate_outer())
+        return Nested_agg_error::PLAIN_AGGREGATE;
+      if (std::find(outers->begin(), outers->end(), sum) == outers->end())
+        outers->push_back(sum);
+      return Nested_agg_error::NONE;
+    }
+    case Item::FIELD_ITEM: {
+      Item_field *field = down_cast<Item_field *>(item);
+      TABLE *table = field->field != nullptr ? field->field->table : nullptr;
+      if (table != nullptr && table->pos_in_table_list != nullptr &&
+          table->pos_in_table_list->query_block == select)
+        return Nested_agg_error::LOCAL_FIELD;
+      return Nested_agg_error::NONE;
+    }
+    case Item::FUNC_ITEM: {
+      Item_func *func = down_cast<Item_func *>(item);
+      if (func->m_is_window_function) return Nested_agg_error::WINDOW_FUNCTION;
+      if (func->functype() == Item_func::GROUPING_FUNC)
+        return Nested_agg_error::GROUPING_FUNCTION;
+      for (uint i = 0; i < func->argument_count(); ++i) {
+        Nested_agg_error error =
+            check_nested_agg_select_expr(func->arguments()[i], select, outers);
+        if (error != Nested_agg_error::NONE) return error;
+      }
+      return Nested_agg_error::NONE;
+    }
+    case Item::COND_ITEM: {
+      List_iterator<Item> li(*down_cast<Item_cond *>(item)->argument_list());
+      for (Item *arg = li++; arg != nullptr; arg = li++) {
+        Nested_agg_error error =
+            check_nested_agg_select_expr(arg, select, outers);
+        if (error != Nested_agg_error::NONE) return error;
+      }
+      return Nested_agg_error::NONE;
+    }
+    case Item::ROW_ITEM: {
+      Item_row *row = down_cast<Item_row *>(item);
+      for (uint i = 0; i < row->cols(); ++i) {
+        Nested_agg_error error =
+            check_nested_agg_select_expr(row->element_index(i), select, outers);
+        if (error != Nested_agg_error::NONE) return error;
+      }
+      return Nested_agg_error::NONE;
+    }
+    default:
+      return Nested_agg_error::NONE;
+  }
+}
+
+/// @returns true if item contains a subquery anywhere in its expression tree.
+static bool nested_agg_expr_has_subquery(Item *item) {
+  if (item == nullptr) return false;
+  return WalkItem(item, enum_walk::PREFIX, [](Item *inner) {
+    return inner->type() == Item::SUBSELECT_ITEM;
+  });
+}
+
+/**
+  @returns true if item contains an outer nested aggregate.
+*/
+static bool nested_agg_expr_has_outer(Item *item) {
+  if (item == nullptr) return false;
+  return WalkItem(item, enum_walk::PREFIX, [](Item *inner) {
+    return inner->type() == Item::SUM_FUNC_ITEM &&
+           down_cast<Item_sum *>(inner)->is_nested_aggregate_outer();
+  });
+}
+
+/**
+  Re-link the 'next' pointer of a moved SQL_I_List after copying it, so that it
+  points into the destination object and not into the source object.
+*/
+static void relink_group_list(SQL_I_List<ORDER> *list) {
+  ORDER **next = &list->first;
+  for (ORDER *order = list->first; order != nullptr; order = order->next)
+    next = &order->next;
+  list->next = next;
+}
+
+/**
+  Redirect ordinary Item_ref nodes in a derived table's HAVING condition so
+  that they point into the derived table's own base_ref_items array.
+
+  The condition was resolved while it belonged to the original query block, so
+  its references point into that block's array. Since the original entries are
+  replaced by placeholders after the rewrite, re-point them to the equivalent
+  entries of the derived table, keeping the values available in its temporary
+  table.
+*/
+static void redirect_having_refs(Query_block *derived) {
+  if (derived->having_cond() == nullptr) return;
+
+  std::vector<Item_ref *> refs;
+  WalkItem(derived->having_cond(), enum_walk::PREFIX, [&refs](Item *inner) {
+    if (inner->type() == Item::REF_ITEM &&
+        down_cast<Item_ref *>(inner)->ref_type() != Item_ref::AGGREGATE_REF)
+      refs.push_back(down_cast<Item_ref *>(inner));
+    return false;
+  });
+
+  for (Item_ref *ref : refs) {
+    if (ref->ref == nullptr || *ref->ref == nullptr) continue;
+    Item *target = *ref->ref;
+    for (size_t i = 0; i < derived->base_ref_items.size(); ++i) {
+      if (derived->base_ref_items[i] == target) {
+        ref->ref = &derived->base_ref_items[i];
+        break;
+      }
+    }
+  }
+}
+
+/**
+  Move the grouping of a query block into a derived table, so that the outer
+  aggregates staying in the query block become ordinary aggregates over the
+  derived table's group rows.
+
+  Example:
+
+  @verbatim
+    SELECT SUM(SUM(v)) FROM t GROUP BY g HAVING SUM(v) > 40;
+
+  is transformed to:
+
+    SELECT SUM(`tmp_nested_1`)
+    FROM (SELECT SUM(v) AS `tmp_nested_1`
+          FROM t
+          GROUP BY g
+          HAVING SUM(v) > 40) AS `derived_1_2`;
+  @endverbatim
+
+  The WHERE, HAVING, GROUP BY and FROM clauses are moved to the derived table,
+  as are the arguments of the outer aggregates. The outer aggregates stay in
+  the original query block, with their arguments replaced by fields of the
+  derived table. ORDER BY is removed because the result is a single row.
+
+  @param thd  session context
+  @returns true on error
+*/
+bool Query_block::transform_nested_aggregates_to_derived(THD *thd) {
+  DBUG_TRACE;
+
+  assert(m_has_nested_aggregate);
+  assert(!m_nested_aggregate_transformed);
+  assert(!thd->lex->is_view_context_analysis());
+
+  if (olap != UNSPECIFIED_OLAP_TYPE) {
+    my_error(ER_NOT_SUPPORTED_YET, MYF(0),
+             "nested aggregate functions with WITH ROLLUP");
+    return true;
+  }
+
+  if (m_windows.elements != 0) {
+    my_error(ER_NOT_SUPPORTED_YET, MYF(0),
+             "nested aggregate functions with window functions");
+    return true;
+  }
+
+  /*
+    HAVING belongs to the grouping level. An outer aggregate in HAVING has no
+    Oracle-compatible semantics, so reject it.
+  */
+  if (m_having_cond != nullptr && nested_agg_expr_has_outer(m_having_cond)) {
+    my_error(ER_INVALID_GROUP_FUNC_USE, MYF(0));
+    return true;
+  }
+
+  /*
+    Collect the outer aggregates reachable from the SELECT list. This includes
+    aggregates hidden behind Item_aggregate_ref, which is how complex SELECT
+    expressions reference the aggregate they were split into.
+  */
+  std::vector<Item_sum *> outer_aggregates;
+  for (Item *item : visible_fields()) {
+    switch (check_nested_agg_select_expr(item, this, &outer_aggregates)) {
+      case Nested_agg_error::NONE:
+        break;
+      case Nested_agg_error::LOCAL_FIELD:
+        my_error(ER_WRONG_FIELD_WITH_GROUP, MYF(0), item->full_name());
+        return true;
+      case Nested_agg_error::PLAIN_AGGREGATE:
+        my_error(ER_MIX_OF_GROUP_FUNC_AND_FIELDS, MYF(0));
+        return true;
+      case Nested_agg_error::WINDOW_FUNCTION:
+        my_error(ER_NOT_SUPPORTED_YET, MYF(0),
+                 "nested aggregate functions with window functions");
+        return true;
+      case Nested_agg_error::GROUPING_FUNCTION:
+        my_error(ER_WRONG_FIELD_WITH_GROUP, MYF(0), "GROUPING function");
+        return true;
+    }
+  }
+
+  if (outer_aggregates.empty()) {
+    /*
+      No outer aggregate in the SELECT list. An outer aggregate only in
+      ORDER BY has complex rules and is not supported; one in HAVING was
+      rejected above.
+    */
+    if (order_list.elements != 0 && nested_agg_expr_has_outer(
+                                        order_list.first->item[0])) {
+      my_error(ER_NOT_SUPPORTED_YET, MYF(0),
+               "nested aggregate functions in ORDER BY without them in the "
+               "SELECT list");
+      return true;
+    }
+    // Should not happen: the flag is only set when an outer aggregate exists.
+    my_error(ER_INVALID_GROUP_FUNC_USE, MYF(0));
+    return true;
+  }
+
+  /*
+    Reject constructs that are not covered by the rewrite: deeper nesting,
+    missing GROUP BY, and subqueries in expressions that have to be moved into
+    the derived table.
+  */
+  for (Item_sum *outer : outer_aggregates) {
+    if (outer->nested_depth() != 1) {
+      my_error(ER_INVALID_GROUP_FUNC_USE, MYF(0));
+      return true;
+    }
+  }
+
+  if (group_list.elements == 0) {
+    my_error(ER_INVALID_GROUP_FUNC_USE, MYF(0));
+    return true;
+  }
+
+  if (nested_agg_expr_has_subquery(m_where_cond) ||
+      nested_agg_expr_has_subquery(m_having_cond)) {
+    my_error(ER_NOT_SUPPORTED_YET, MYF(0),
+             "subqueries in WHERE or HAVING of a nested aggregate query");
+    return true;
+  }
+
+  for (ORDER *group = group_list.first; group != nullptr; group = group->next) {
+    if (nested_agg_expr_has_subquery(*group->item)) {
+      my_error(ER_NOT_SUPPORTED_YET, MYF(0),
+               "subqueries in GROUP BY of a nested aggregate query");
+      return true;
+    }
+  }
+
+  // Collect every argument of every outer aggregate, in SELECT list order.
+  std::vector<Nested_aggregate_argument> arguments;
+  for (Item_sum *outer : outer_aggregates) {
+    for (uint i = 0; i < outer->argument_count(); ++i) {
+      arguments.push_back({outer, i, outer->arguments()[i], {}});
+    }
+  }
+
+  Prepared_stmt_arena_holder ps_arena_holder(thd);
+
+  Query_expression *const old_slave = slave;
+  slave = nullptr;
+
+  // The new derived table takes over WHERE and HAVING from this query block.
+  Query_expression *new_slu = parent_lex->create_query_expr_and_block(
+      thd, this, m_where_cond, m_having_cond, CTX_DERIVED);
+  if (new_slu == nullptr) return true;
+  Query_block *new_derived = new_slu->first_query_block();
+
+  m_where_cond = nullptr;
+  m_having_cond = nullptr;
+  new_derived->linkage = DERIVED_TABLE_TYPE;
+
+  // Inherit item counts for safe allocation of base_ref_items.
+  new_derived->select_n_having_items = select_n_having_items;
+  new_derived->select_n_where_fields = select_n_where_fields;
+  new_derived->n_sum_items = n_sum_items;
+  new_derived->n_child_sum_items = n_child_sum_items;
+  new_derived->cond_count = cond_count;
+  new_derived->between_count = between_count;
+  new_derived->m_agg_func_used = m_agg_func_used;
+  new_derived->m_json_agg_func_used = m_json_agg_func_used;
+  new_derived->with_sum_func = true;
+
+  /*
+    HAVING may refer to select-list entries through Item_ref. Those entries
+    belong to this query block and may later be replaced by placeholders, so
+    re-point the references into the derived table after it has been resolved
+    (see below). For now, just note that the condition has moved.
+  */
+
+  // Any moved Item_ident needs the new name resolution context.
+  Item *conds[2] = {new_derived->m_where_cond, new_derived->m_having_cond};
+  for (auto cond : conds) {
+    if (update_context_to_derived(cond, new_derived)) return true;
+  }
+
+  assert(join == nullptr);
+
+  // Move FROM tables under the new derived table with fix ups.
+  new_derived->table_list = table_list;
+  table_list.clear();
+  for (TABLE_LIST *tables = new_derived->table_list.first; tables != nullptr;
+       tables = tables->next_local) {
+    tables->query_block = new_derived;
+    if (update_context_to_derived(tables->join_cond(), new_derived))
+      return true;
+  }
+  new_derived->derived_table_count = derived_table_count;
+  derived_table_count = 0;
+  new_derived->materialized_derived_table_count =
+      materialized_derived_table_count;
+  materialized_derived_table_count = 0;
+  new_derived->partitioned_table_count = partitioned_table_count;
+  partitioned_table_count = 0;
+  new_derived->table_func_count = table_func_count;
+  table_func_count = 0;
+
+  assert(join_list == &top_join_list);
+  new_derived->top_join_list = std::move(top_join_list);
+  top_join_list.clear();
+  new_derived->join_list = &new_derived->top_join_list;
+  new_derived->leaf_tables = leaf_tables;
+  new_derived->leaf_table_count = leaf_table_count;
+  leaf_tables = nullptr;
+  leaf_table_count = 0;
+
+  // Move GROUP BY. The derived table will redo its own setup_group().
+  new_derived->group_list = group_list;
+  group_list.clear();
+  relink_group_list(&new_derived->group_list);
+  new_derived->olap = olap;
+  olap = UNSPECIFIED_OLAP_TYPE;
+
+  for (ORDER *group = new_derived->group_list.first; group != nullptr;
+       group = group->next) {
+    Item *group_expr = (*group->item)->real_item();
+    if (update_context_to_derived(group_expr, new_derived)) return true;
+    group->set_item_to_expression(group_expr);
+  }
+
+  /*
+    Inner aggregates in HAVING now belong to the derived table.
+  */
+  if (new_derived->m_having_cond != nullptr) {
+    Item_sum::Collect_grouped_aggregate_info having_aggs(this);
+    if (new_derived->m_having_cond->walk(&Item::collect_grouped_aggregates,
+                                         enum_walk::PREFIX,
+                                         pointer_cast<uchar *>(&having_aggs)))
+      return true; /* purecov: inspected */
+    for (Item_sum *agg : having_aggs.list) {
+      agg->base_query_block = new_derived;
+      agg->aggr_query_block = new_derived;
+      agg->in_sum_func = nullptr;
+    }
+    new_derived->m_having_cond->update_used_tables();
+  }
+
+  /*
+    Lift the arguments of the outer aggregates into the derived table's select
+    list, and let the inner aggregates they contain belong to the derived
+    table. Arguments shared by several outer aggregates are lifted once.
+  */
+  std::vector<Item *> lifted_exprs;
+  int field_no = 0;
+  for (Nested_aggregate_argument &arg : arguments) {
+    if (std::find(lifted_exprs.begin(), lifted_exprs.end(), arg.m_expr) !=
+        lifted_exprs.end())
+      continue;
+
+    if (nested_agg_expr_has_subquery(arg.m_expr)) {
+      my_error(ER_NOT_SUPPORTED_YET, MYF(0),
+               "subqueries in arguments of nested aggregate functions");
+      return true;
+    }
+
+    Item_sum::Collect_grouped_aggregate_info inner_aggs(this);
+    if (arg.m_expr->walk(&Item::collect_grouped_aggregates,
+                         enum_walk::PREFIX, pointer_cast<uchar *>(&inner_aggs)))
+      return true; /* purecov: inspected */
+    if (inner_aggs.m_break_off) {
+      my_error(ER_NOT_SUPPORTED_YET, MYF(0),
+               "nested aggregate functions referring to outer query blocks");
+      return true;
+    }
+    for (Item_sum *agg : inner_aggs.list) {
+      agg->base_query_block = new_derived;
+      agg->aggr_query_block = new_derived;
+      agg->in_sum_func = nullptr;
+    }
+
+    if (update_context_to_derived(arg.m_expr, new_derived)) return true;
+
+    char buff[100];
+    std::snprintf(buff, sizeof(buff), "tmp_nested_%d", ++field_no);
+    char *namep = thd->mem_strdup(buff);
+    if (namep == nullptr) return true;
+    arg.m_expr->orig_name.set(arg.m_expr->item_name.ptr());
+    arg.m_expr->item_name.set(namep);
+    arg.m_name.assign(buff);
+
+    if (new_derived->add_item_to_list(arg.m_expr)) return true;
+    lifted_exprs.push_back(arg.m_expr);
+  }
+
+  /*
+    Retain only subqueries from the SELECT list in this query block; all other
+    query expressions move to the new derived table.
+  */
+  Item_subselect::Collect_subq_info subqueries(this);
+  for (Item *item : fields) {
+    if (item->walk(&Item::collect_subqueries, enum_walk::PREFIX,
+                   pointer_cast<uchar *>(&subqueries)))
+      return true; /* purecov: inspected */
+  }
+
+  assert(slave != nullptr);
+  assert(new_derived->slave == nullptr);
+
+  std::vector<Query_expression *> old_slaves;
+  for (Query_expression *cand = old_slave; cand != nullptr; cand = cand->next)
+    old_slaves.push_back(cand);
+
+  for (auto cand : old_slaves) {
+    if (cand == new_slu) continue;  // already in place
+    if (subqueries.contains(cand))
+      cand->include_down(parent_lex, this);
+    else {
+      cand->include_down(parent_lex, new_derived);
+      Item_ident::Depended_change info{this, new_derived};
+      if (cand->walk(&Item::update_depended_from, enum_walk::SUBQUERY_PREFIX,
+                     pointer_cast<uchar *>(&info)))
+        return true; /* purecov: inspected */
+    }
+  }
+
+  // Add the derived table to this query block's FROM list.
+  TABLE_LIST *tl = synthesize_derived(thd, new_slu, nullptr, false, false);
+  if (tl == nullptr) return true;
+
+  if (!(tl->derived_result = new (thd->mem_root) Query_result_union()))
+    return true; /* purecov: inspected */
+  new_slu->set_query_result(tl->derived_result);
+
+  top_join_list.push_back(tl);
+
+  // Update this query block's and the derived table's name resolution contexts.
+  context.table_list = tl;
+  context.first_name_resolution_table = tl;
+  new_derived->context.init();
+  new_derived->context.table_list = table_list.first;
+  new_derived->context.query_block = new_derived;
+  new_derived->context.outer_context = &context;
+  new_derived->context.first_name_resolution_table = table_list.first;
+
+  if (setup_tables(thd, get_table_list(), false)) return true;
+
+  // Resolving the new derived table needs the normal arena.
+  if (resolve_placeholder_tables(thd, true)) return true;
+
+  {
+    Prepared_stmt_arena_holder ps_arena_holder_inner(thd);
+    assert(tl->table != nullptr);
+
+    redirect_having_refs(new_derived);
+
+    /*
+      Replace the arguments of the outer aggregates with fields read from the
+      derived table. Locate each expression in the derived table's field list,
+      since resolution may have inserted hidden items (e.g. a split inner
+      aggregate) before it.
+    */
+    std::unordered_map<Item *, Item_field *> replacements;
+    for (Nested_aggregate_argument &arg : arguments) {
+      Item_field *replacement;
+      auto it = replacements.find(arg.m_expr);
+      if (it != replacements.end()) {
+        replacement = it->second;
+      } else {
+        /*
+          The derived table's columns contain only the visible select items;
+          hidden items (e.g. GROUP BY fields) do not get a column. Locate the
+          lifted expression among the visible items.
+        */
+        size_t field_index = 0;
+        bool found = false;
+        for (Item *item : new_derived->fields) {
+          if (item == arg.m_expr ||
+              (item->item_name.length() == arg.m_name.length() &&
+               std::strncmp(item->item_name.ptr(), arg.m_name.c_str(),
+                            arg.m_name.length()) == 0)) {
+            assert(!item->hidden);
+            found = true;
+            break;
+          }
+          if (!item->hidden) ++field_index;
+        }
+        if (!found || field_index >= tl->table->s->fields) {
+          my_error(ER_INTERNAL_ERROR, MYF(0),
+                   "nested aggregate transformation lost a derived column");
+          return true;
+        }
+        replacement = new (thd->mem_root) Item_field(tl->table->field[field_index]);
+        if (replacement == nullptr) return true;
+        replacements.emplace(arg.m_expr, replacement);
+      }
+      /*
+        Replace the argument directly rather than via set_arg(): the latter
+        records a change that would be rolled back at the end of preparation,
+        while this rewrite must be permanent (also for prepared statements).
+      */
+      arg.m_outer->arguments()[arg.m_arg_index] = replacement;
+      arg.m_outer->update_used_tables();
+    }
+
+    /*
+      ORDER BY has no effect on a one-row result, and its expressions may refer
+      to tables that have been moved down, so remove it.
+    */
+    empty_order_list(this);
+    hidden_order_field_count = 0;
+
+    /*
+      The GROUP BY hidden fields of this query block referred to the moved
+      tables. They are not needed anymore; replace them with constants so that
+      field indexes used by base_ref_items stay valid. Keep the hidden field
+      holding an outer aggregate referenced from the SELECT list.
+    */
+    std::vector<Item *> kept_hidden;
+    for (Item *item : visible_fields()) {
+      WalkItem(item, enum_walk::PREFIX, [&kept_hidden](Item *inner) {
+        if (inner->type() != Item::REF_ITEM) return false;
+        Item_ref *ref = down_cast<Item_ref *>(inner);
+        if (ref->ref_type() != Item_ref::AGGREGATE_REF || ref->ref == nullptr)
+          return false;
+        Item *target = *ref->ref;
+        if (target != nullptr && target->type() == Item::SUM_FUNC_ITEM &&
+            down_cast<Item_sum *>(target)->is_nested_aggregate_outer())
+          kept_hidden.push_back(target);
+        return false;
+      });
+    }
+    for (size_t i = 0; i < fields.size(); ++i) {
+      Item *item = fields[i];
+      if (!item->hidden) continue;
+      if (std::find(kept_hidden.begin(), kept_hidden.end(), item) !=
+          kept_hidden.end())
+        continue;
+      Item_int *placeholder = new (thd->mem_root) Item_int(0);
+      if (placeholder == nullptr) return true;
+      placeholder->hidden = true;
+      fields[i] = placeholder;
+      for (size_t j = 0; j < base_ref_items.size(); ++j) {
+        if (base_ref_items[j] == item) base_ref_items[j] = placeholder;
+      }
+    }
+
+    hidden_group_field_count = 0;
+    group_list.clear();
+    olap = UNSPECIFIED_OLAP_TYPE;
+
+    m_nested_aggregate_transformed = true;
+    m_force_full_group_by = true;
+    new_derived->m_force_full_group_by = true;
+
+    OPT_TRACE_TRANSFORM(&thd->opt_trace, trace_wrapper, trace_object,
+                        select_number, "grouped query with nested aggregates",
+                        "aggregate over grouped derived table");
+    opt_trace_print_expanded_query(thd, this, &trace_object);
+  }  // Prepared_stmt_arena_holder scope
+
   return false;
 }
 

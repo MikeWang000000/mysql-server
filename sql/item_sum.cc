@@ -309,8 +309,22 @@ bool Item_sum::check_sum_func(THD *thd, Item **ref) {
   */
   if (aggr_query_block == nullptr ||
       aggr_query_block->nest_level <= max_sum_func_level) {
-    my_error(ER_INVALID_GROUP_FUNC_USE, MYF(0));
-    return true;
+    /*
+      Allow exactly one level of aggregation nesting inside the same query
+      block, e.g. SUM(SUM(x)) with GROUP BY. Oracle-compatible semantics are
+      implemented by rewriting such an outer aggregate into a derived table,
+      cf. Query_block::transform_nested_aggregates_to_derived(). Deeper
+      nesting, and nesting without GROUP BY, remain errors.
+    */
+    if (aggr_query_block != nullptr && !m_is_window_function &&
+        aggr_query_block == base_query_block && m_nested_depth == 1 &&
+        aggr_query_block->group_list.elements > 0) {
+      m_nested_aggregate_outer = true;
+      aggr_query_block->set_has_nested_aggregate(true);
+    } else {
+      my_error(ER_INVALID_GROUP_FUNC_USE, MYF(0));
+      return true;
+    }
   }
 
   if (aggr_query_block != base_query_block) {
@@ -381,6 +395,18 @@ bool Item_sum::check_sum_func(THD *thd, Item **ref) {
                                             int8(aggr_query_block->nest_level));
     in_sum_func->max_sum_func_level =
         max(in_sum_func->max_sum_func_level, max_sum_func_level);
+
+    /*
+      Propagate the depth of same-query-block aggregate nesting to the
+      containing aggregate. This lets the containing aggregate distinguish
+      SUM(SUM(x)) (supported) from SUM(SUM(SUM(x))) (rejected) in its own
+      check_sum_func() call.
+    */
+    if (!m_is_window_function &&
+        aggr_query_block == in_sum_func->base_query_block) {
+      in_sum_func->m_nested_depth =
+          std::max<uint8>(in_sum_func->m_nested_depth, m_nested_depth + 1);
+    }
   }
 
   aggr_query_block->set_agg_func_used(true);
@@ -426,6 +452,8 @@ Item_sum::Item_sum(THD *thd, const Item_sum *item)
       base_query_block(item->base_query_block),
       aggr_query_block(item->aggr_query_block),
       allow_group_via_temp_table(item->allow_group_via_temp_table),
+      m_nested_aggregate_outer(item->m_nested_aggregate_outer),
+      m_nested_depth(item->m_nested_depth),
       forced_const(item->forced_const) {
   assert(arg_count == item->arg_count);
   with_distinct = item->with_distinct;
